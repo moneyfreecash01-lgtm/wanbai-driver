@@ -1,0 +1,16 @@
+.vscode/*
+.history/
+
+**/.DS_Store
+
+build
+
+test
+script
+
+*.zip
+compiler/
+/compiler
+/inspiration
+/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf
+arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf
