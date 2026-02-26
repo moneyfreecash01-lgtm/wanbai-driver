@@ -21,8 +21,8 @@
 KPM_NAME("wanbai");
 KPM_VERSION("1.0.0");
 KPM_LICENSE("GPL v2");
-KPM_AUTHOR("pubg-cheat");
-KPM_DESCRIPTION("Kernel memory driver for 4.9 to 6.12 (/dev/wanbai)");
+KPM_AUTHOR("@alex5402");
+KPM_DESCRIPTION("Universal KPM for 4.9 to 6.12 (/dev/wanbai)");
 
 #define OP_INIT_KEY     0x800
 #define OP_READ_MEM     0x801
@@ -67,46 +67,26 @@ struct device;
 #define MISC_DYNAMIC_MINOR 255
 
 /* -----------------------------------------------------------------------
- * file_operations ABI layout for arm64 Linux 4.14 (NO iopoll field!)
+ * file_operations: layout varies across kernel versions.
  *
- * 4.14 layout (no iopoll – that was added in 5.1):
- *   owner            0x00
- *   llseek           0x08
- *   read             0x10
- *   write            0x18
- *   read_iter        0x20
- *   write_iter       0x28
- *   iterate          0x30
- *   iterate_shared   0x38
- *   poll             0x40
- *   unlocked_ioctl   0x48
- *   compat_ioctl     0x50
+ * The offset of unlocked_ioctl changes based on whether iopoll and iterate
+ * are present:
+ *   4.9-5.0  : no iopoll, has iterate   → ioctl at 0x48, open at 0x60
+ *   5.1-5.8  : has iopoll, has iterate   → ioctl at 0x50, open at 0x70
+ *   5.9-6.12 : has iopoll, no iterate    → ioctl at 0x48, open at 0x68
+ *
+ * We probe at runtime using def_chr_fops + chrdev_open to find the open
+ * offset, then derive ioctl = open - 0x18 (pre-4.20) or open - 0x20 (4.20+).
+ * We use a raw zeroed buffer and write function pointers at the probed offsets.
  * --------------------------------------------------------------------- */
-struct kpm_file_operations {
-    struct module    *owner;           /* 0x00 */
-    void             *llseek;          /* 0x08 */
-    void             *read;            /* 0x10 */
-    void             *write;           /* 0x18 */
-    void             *read_iter;       /* 0x20 */
-    void             *write_iter;      /* 0x28 */
-    /* NOTE: NO iopoll here — that field was added in 5.1+ */
-    void             *iterate;         /* 0x30 */
-    void             *iterate_shared;  /* 0x38 */
-    void             *poll;            /* 0x40 */
-    long (*unlocked_ioctl)(struct file *, unsigned int, unsigned long); /* 0x48 */
-    long (*compat_ioctl)(struct file *, unsigned int, unsigned long);   /* 0x50 */
-    /* remaining fields zero = no-op */
-    void             *mmap;            /* 0x58 */
-    void             *open;            /* 0x60 */
-    void             *flush;           /* 0x68 */
-    void             *release;         /* 0x70 */
-};
+static int fops_ioctl_offset;   /* detected at init */
+static int fops_compat_offset;  /* ioctl_offset + 8 */
 
 /* miscdevice ABI layout for arm64 Linux 4.x–6.x */
 struct kpm_miscdevice {
     int                          minor;
     const char                  *name;
-    const struct kpm_file_operations *fops;
+    const void                  *fops;
     struct { void *next; void *prev; } list;  /* list_head */
     struct device               *parent;
     struct device               *this_device;
@@ -160,11 +140,21 @@ static t_strncpy_from_user kp_strncpy_from_user;
 typedef int (*t_snprintf)(char *buf, size_t size, const char *fmt, ...);
 static t_snprintf kp_snprintf;
 
+typedef long (*t_probe_kernel_read)(void *dst, const void *src, size_t size);
+static t_probe_kernel_read kp_probe_kernel_read;
+
+typedef long (*t_copy_from_kernel_nofault)(void *dst, const void *src, size_t size);
+static t_copy_from_kernel_nofault kp_copy_from_kernel_nofault;
+
 typedef struct file *(*t_filp_open)(const char *filename, int flags, int mode);
 static t_filp_open kp_filp_open;
 
 typedef ssize_t (*t_kernel_read)(struct file *file, void *buf, size_t count, loff_t *pos);
-static t_kernel_read kp_kernel_read;
+static t_kernel_read kp_kernel_read;     /* 4.14+ public API */
+static t_kernel_read kp___kernel_read;   /* 5.4+  kernel-buffer safe */
+
+typedef ssize_t (*t_vfs_read)(struct file *file, char *buf, size_t count, loff_t *pos);
+static t_vfs_read kp_vfs_read;
 
 typedef int (*t_filp_close)(struct file *file, void *id);
 static t_filp_close kp_filp_close;
@@ -177,33 +167,57 @@ static t_filp_close kp_filp_close;
 #define FOLL_WRITE  0x01
 
 /* -----------------------------------------------------------------------
- * VMA walk offsets (arm64, common 4.x–6.x)
+ * VMA walk offsets (arm64)
+ *
+ * mm_struct.mmap       = 0x00  (first field, the VMA list head)
+ * vm_area_struct layout:
+ *   vm_start           = 0x00
+ *   vm_end             = 0x08
+ *   vm_next            = 0x10
+ *   vm_prev            = 0x18
+ *   vm_mm              = probed at runtime (typically 0x40)
+ *   vm_file            = vm_mm + 0x60 (fixed distance on arm64 4.x-5.x)
  * --------------------------------------------------------------------- */
-#define MM_MMAP_OFFSET      0x40
-#define MM_MMAP_LOCK_OFFSET 0x58
-#define VMA_VM_NEXT         0x08
-#define VMA_VM_FILE         0xd0
+#define MM_MMAP_OFFSET      0x0
 
-static inline struct vm_area_struct *mm_mmap(struct mm_struct *mm)
+/* Safe memory read helper to prevent panics when reading unpinned memory */
+static inline int kp_safe_read(void *dst, const void *src, size_t size)
 {
-    return *(struct vm_area_struct **)((char *)mm + MM_MMAP_OFFSET);
+    if (kp_copy_from_kernel_nofault)
+        return kp_copy_from_kernel_nofault(dst, src, size);
+    if (kp_probe_kernel_read)
+        return kp_probe_kernel_read(dst, src, size);
+    return -1;
 }
-static inline uint64_t vma_vm_start(struct vm_area_struct *v)
+
+/* Cached vm_file offset, probed once at first use */
+static int vma_vm_file_off = 0;
+
+/* Probe vm_file offset by finding vm_mm back-pointer in the first VMA.
+ * Every VMA has vma->vm_mm == mm.  We scan the VMA struct for a word
+ * that equals mm, that gives us the vm_mm offset.  Then vm_file is at
+ * a fixed distance from vm_mm:
+ *   vm_page_prot(8) + vm_flags(8) + shared(32) + anon_vma_chain(16) +
+ *   anon_vma(8) + vm_ops(8) + vm_pgoff(8) = 0x60
+ * So vm_file = vm_mm_offset + 0x60 */
+static int probe_vm_file_offset(struct vm_area_struct *vma, struct mm_struct *mm)
 {
-    return *(uint64_t *)v;
-}
-static inline struct vm_area_struct *vma_vm_next(struct vm_area_struct *v)
-{
-    return *(struct vm_area_struct **)((char *)v + VMA_VM_NEXT);
-}
-static inline void *vma_vm_file(struct vm_area_struct *v)
-{
-    return *(void **)((char *)v + VMA_VM_FILE);
-}
-/* file::f_path at offset 0x10 on arm64 */
-static inline struct path *file_path(void *filp)
-{
-    return (struct path *)((char *)filp + 0x10);
+    uint64_t mm_val = (uint64_t)mm;
+    /* Scan offsets 0x20..0x80 looking for vm_mm == mm */
+    for (int off = 0x20; off <= 0x80; off += 8) {
+        uint64_t val = 0;
+        if (kp_safe_read(&val, (char *)vma + off, sizeof(val)))
+            continue;
+        if (val == mm_val) {
+            int file_off = off + 0x60;
+            printk(KERN_INFO "wanbai: probed vm_mm at 0x%x => vm_file at 0x%x\n",
+                   off, file_off);
+            return file_off;
+        }
+    }
+    /* Fallback: try common offsets */
+    printk(KERN_INFO "wanbai: vm_mm probe failed, trying default vm_file=0xa0\n");
+    return 0xa0;
 }
 
 /* Inline strstr (bare-metal gcc emits kf_strstr libcall otherwise) */
@@ -284,49 +298,197 @@ static long xmem(int32_t pid, uint64_t addr, void *buf, uint64_t sz, int wr)
 }
 
 /* -----------------------------------------------------------------------
- * Module base via VMA walk
+ * Module base via direct VMA walk.
+ *
+ * Reading /proc/<pid>/maps from kernel context fails on GKI 5.x+ kernels
+ * because seq_file uses copy_to_user() internally, which breaks with
+ * kernel buffers after set_fs() removal.
+ *
+ * Instead, we walk the VMA linked list directly:
+ *   get_task_mm() → mm->mmap → iterate vm_next → check vm_file →
+ *   read dentry name → match against requested module name.
+ *
+ * The vm_file offset is probed at runtime by finding the vm_mm
+ * back-pointer in the first VMA (vma->vm_mm == mm), then adding 0x60.
  * --------------------------------------------------------------------- */
-static uint64_t module_base(int32_t pid, const char *name)
+
+/* dentry.d_name is a struct qstr at offset 0x20 in dentry.
+ * qstr layout: { union { u64 hash_len; struct { u32 hash; u32 len; }; }; const char *name; }
+ * So dentry->d_name.name is at dentry + 0x20 + 0x08 = dentry + 0x28 */
+#define DENTRY_D_NAME_NAME_OFF  0x28
+
+/* file->f_path is at offset 0x10 in struct file on arm64,
+ * f_path is { struct vfsmount *mnt; struct dentry *dentry; }
+ * so file->f_path.dentry = file + 0x10 + 0x08 = file + 0x18 */
+#define FILE_F_PATH_DENTRY_OFF  0x18
+
+static const char *dentry_name_from_file(void *filp, char *name_buf, size_t buf_size)
 {
-    char path[64];
-    struct file *f;
-    char *buf;
-    loff_t pos = 0;
+    if (!filp) return NULL;
+    void *dentry = NULL;
+    if (kp_safe_read(&dentry, (char *)filp + FILE_F_PATH_DENTRY_OFF, sizeof(dentry)) || !dentry)
+        return NULL;
+    
+    char *name_ptr = NULL;
+    if (kp_safe_read(&name_ptr, (char *)dentry + DENTRY_D_NAME_NAME_OFF, sizeof(name_ptr)) || !name_ptr)
+        return NULL;
+
+    /* Safely read the string up to buf_size */
+    for (size_t i = 0; i < buf_size - 1; i++) {
+        char c;
+        if (kp_safe_read(&c, name_ptr + i, 1) || c == '\0') {
+            name_buf[i] = '\0';
+            break;
+        }
+        name_buf[i] = c;
+    }
+    name_buf[buf_size - 1] = '\0';
+    return name_buf;
+}
+
+/* Simple string comparison for matching just the basename */
+static int kpm_str_ends_with(const char *str, const char *suffix)
+{
+    size_t slen = kpm_strlen(str);
+    size_t sufflen = kpm_strlen(suffix);
+    if (sufflen > slen) return 0;
+    const char *p = str + slen - sufflen;
+    while (*p && *suffix) {
+        if (kpm_tolower_char(*p) != kpm_tolower_char(*suffix)) return 0;
+        p++; suffix++;
+    }
+    return !*suffix;
+}
+
+static uint64_t module_base_vma(int32_t pid, const char *name)
+{
     uint64_t base = 0;
+    struct pid *p = kp_find_get_pid(pid);
+    if (!p) return 0;
+    struct task_struct *t = kp_get_pid_task(p, PIDTYPE_PID);
+    kp_put_pid(p);
+    if (!t) return 0;
 
-    printk(KERN_INFO "wanbai: module_base called pid=%d name=%s\n", pid, name);
-
-    if (!kp_snprintf || !kp_filp_open || !kp_kernel_read || !kp_filp_close) {
-        printk(KERN_INFO "wanbai: module_base missing kfuncs: snprintf=%p filp_open=%p kernel_read=%p filp_close=%p\n",
-               kp_snprintf, kp_filp_open, kp_kernel_read, kp_filp_close);
+    struct mm_struct *mm = kp_get_task_mm(t);
+    safe_put_task(t);
+    if (!mm) {
+        printk(KERN_INFO "wanbai: get_task_mm failed for pid=%d\n", pid);
         return 0;
     }
 
+    /* We MUST use safe reads (nofault) because we don't hold mmap_lock. */
+    if (!kp_probe_kernel_read && !kp_copy_from_kernel_nofault) {
+        printk(KERN_INFO "wanbai: VMA walk missing safe read functions!\n");
+        kp_mmput(mm);
+        return 0;
+    }
+
+    /* Safely read mm->mmap (first field of mm_struct) */
+    struct vm_area_struct *vma = NULL;
+    if (kp_safe_read(&vma, (char *)mm + MM_MMAP_OFFSET, sizeof(vma)) || !vma) {
+        printk(KERN_INFO "wanbai: mm->mmap is NULL or unreadable (mm=%px)\n", mm);
+        kp_mmput(mm);
+        return 0;
+    }
+
+    printk(KERN_INFO "wanbai: mm=%px first_vma=%px\n", mm, vma);
+
+    /* Probe vm_file offset on first call */
+    if (!vma_vm_file_off) {
+        vma_vm_file_off = probe_vm_file_offset(vma, mm);
+    }
+
+    int count = 0;
+    char fname_buf[128];
+
+    while (vma && count < 100000) {
+        count++;
+        /* Read vm_file at probed offset */
+        void *filp = NULL;
+        kp_safe_read(&filp, (char *)vma + vma_vm_file_off, sizeof(filp));
+
+        if (filp && !IS_ERR((void *)filp)) {
+            const char *fname = dentry_name_from_file(filp, fname_buf, sizeof(fname_buf));
+            if (count <= 5) {
+                printk(KERN_INFO "wanbai: VMA[%d] start=%llx filp=%px fname='%s'\n",
+                       count,
+                       *(uint64_t *)&vma, /* will be printed as pointer */
+                       filp,
+                       fname ? fname : "(null)");
+            }
+            if (fname && kpm_str_ends_with(fname, name)) {
+                uint64_t vs = 0;
+                kp_safe_read(&vs, vma, sizeof(vs));
+                base = vs;
+                printk(KERN_INFO "wanbai: VMA match '%s' => base=%llx (count=%d)\n",
+                       fname, base, count);
+                break;
+            }
+        }
+        /* Read next VMA pointer (vm_next at offset 0x10) */
+        void *next = NULL;
+        if (kp_safe_read(&next, (char *)vma + 0x10, sizeof(next)))
+            break;
+        vma = (struct vm_area_struct *)next;
+    }
+
+    printk(KERN_INFO "wanbai: VMA walk done, iterated %d VMAs, base=%llx\n", count, base);
+    kp_mmput(mm);
+    return base;
+}
+
+/* Try VMA walk first, fall back to /proc/maps file reading */
+static uint64_t module_base(int32_t pid, const char *name)
+{
+    uint64_t base = 0;
+    printk(KERN_INFO "wanbai: module_base called pid=%d name=%s\n", pid, name);
+
+    /* Method 1: direct VMA walk (works on all kernels 4.9-6.x) */
+    if (kp_get_task_mm && kp_mmput) {
+        base = module_base_vma(pid, name);
+        if (base) {
+            printk(KERN_INFO "wanbai: module_base result for %s = %llx (VMA walk)\n",
+                   name, base);
+            return base;
+        }
+        printk(KERN_INFO "wanbai: VMA walk found nothing, trying /proc/maps...\n");
+    }
+
+    /* Method 2: /proc/maps reading (works on 4.x kernels with set_fs) */
+    if (!kp_snprintf || !kp_filp_open || !kp_filp_close) {
+        printk(KERN_INFO "wanbai: module_base: no file I/O funcs available\n");
+        return 0;
+    }
+
+    char path[64];
     kp_snprintf(path, sizeof(path), "/proc/%d/maps", pid);
     printk(KERN_INFO "wanbai: opening %s\n", path);
 
-    f = kp_filp_open(path, 0, 0); /* O_RDONLY = 0 */
+    struct file *f = kp_filp_open(path, 0, 0);
     if (IS_ERR(f)) {
         printk(KERN_INFO "wanbai: failed to open %s err=%ld\n", path, (long)(f));
         return 0;
     }
     printk(KERN_INFO "wanbai: %s opened OK\n", path);
 
-    buf = kp_kmalloc(PAGE_SIZE + 1, GFP_KERNEL);
-    if (!buf) {
-        kp_filp_close(f, 0);
-        return 0;
-    }
+    char *buf = kp_kmalloc(PAGE_SIZE + 1, GFP_KERNEL);
+    if (!buf) { kp_filp_close(f, 0); return 0; }
 
+    loff_t pos = 0;
     int chunk = 0;
     while (1) {
-        ssize_t bytes = kp_kernel_read(f, buf, PAGE_SIZE, &pos);
+        ssize_t bytes = -1;
+        if (bytes <= 0 && kp___kernel_read)
+            bytes = kp___kernel_read(f, buf, PAGE_SIZE, &pos);
+        if (bytes <= 0 && kp_kernel_read)
+            bytes = kp_kernel_read(f, buf, PAGE_SIZE, &pos);
+        if (bytes <= 0 && kp_vfs_read)
+            bytes = kp_vfs_read(f, buf, PAGE_SIZE, &pos);
         if (bytes <= 0) {
-            printk(KERN_INFO "wanbai: kernel_read chunk=%d bytes=%ld (done or error)\n", chunk, (long)bytes);
+            printk(KERN_INFO "wanbai: kernel_read chunk=%d bytes=%ld (done or error)\n",
+                   chunk, (long)bytes);
             break;
         }
-        if (chunk == 0)
-            printk(KERN_INFO "wanbai: first 64 bytes: %.64s\n", buf);
         chunk++;
         buf[bytes] = '\0';
 
@@ -334,28 +496,23 @@ static uint64_t module_base(int32_t pid, const char *name)
         while (line && *line) {
             char *nl = kpm_strchr(line, '\n');
             if (nl) *nl = '\0';
-
             if (kpm_strcasestr(line, name)) {
                 uint64_t val = 0;
-                char *p = line;
-                while (*p) {
-                    char c = *p++;
+                char *p2 = line;
+                while (*p2) {
+                    char c = *p2++;
                     if (c >= '0' && c <= '9') val = (val << 4) | (c - '0');
                     else if (c >= 'a' && c <= 'f') val = (val << 4) | (c - 'a' + 10);
                     else if (c >= 'A' && c <= 'F') val = (val << 4) | (c - 'A' + 10);
                     else break;
                 }
                 base = val;
-                printk(KERN_INFO "wanbai: found '%s' in line => base=%llx\n", name, base);
                 break;
             }
-
             if (!nl) {
                 if (bytes == PAGE_SIZE) {
                     int len = kpm_strlen(line);
-                    if (len < PAGE_SIZE) {
-                        pos -= len;
-                    }
+                    if (len < PAGE_SIZE) pos -= len;
                 }
                 break;
             }
@@ -435,7 +592,7 @@ static long wanbai_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
  * Device node pointers (dynamically allocated to avoid ABI overflows
  * and Read-Only .data permission panics on some kernels)
  * --------------------------------------------------------------------- */
-static struct kpm_file_operations *p_wanbai_fops;
+static void      *p_wanbai_fops;   /* raw buffer, not a typed struct */
 static struct kpm_miscdevice      *p_wanbai_dev;
 
 /* -----------------------------------------------------------------------
@@ -471,7 +628,17 @@ static long wanbai_init(const char *args, const char *event, void *__user rsv)
     kp_snprintf = (t_snprintf)kallsyms_lookup_name("snprintf");
     kp_filp_open = (t_filp_open)kallsyms_lookup_name("filp_open");
     kp_kernel_read = (t_kernel_read)kallsyms_lookup_name("kernel_read");
+    kp___kernel_read = (t_kernel_read)kallsyms_lookup_name("__kernel_read");
+    kp_vfs_read = (t_vfs_read)kallsyms_lookup_name("vfs_read");
     kp_filp_close = (t_filp_close)kallsyms_lookup_name("filp_close");
+    kp_probe_kernel_read = (t_probe_kernel_read)kallsyms_lookup_name("probe_kernel_read");
+    kp_copy_from_kernel_nofault = (t_copy_from_kernel_nofault)kallsyms_lookup_name("copy_from_kernel_nofault");
+
+    printk(KERN_INFO "wanbai: safe read funcs: probe=%p nofault=%p\n",
+           kp_probe_kernel_read, kp_copy_from_kernel_nofault);
+
+    printk(KERN_INFO "wanbai: read funcs: __kernel_read=%p kernel_read=%p vfs_read=%p\n",
+           kp___kernel_read, kp_kernel_read, kp_vfs_read);
 
     /* copy_from_user depends on arm64 kernel version */
     kp_copy_from_user = (t_copy_from_user)kallsyms_lookup_name("_copy_from_user");
@@ -499,6 +666,76 @@ static long wanbai_init(const char *args, const char *event, void *__user rsv)
 
     printk(KERN_INFO "wanbai: symbols OK\n");
 
+    /* ------------------------------------------------------------------
+     * Probe the unlocked_ioctl offset in file_operations.
+     *
+     * Strategy: look up def_chr_fops (the default char-device fops present
+     * in all kernels).  Its 'open' field == chrdev_open.  Find chrdev_open
+     * in the struct to determine the 'open' offset, then derive ioctl:
+     *
+     *   open at 0x60 → ioctl = 0x48  (4.9-4.19, no mmap_supported_flags)
+     *   open at 0x68 → ioctl = 0x48  (4.20-5.0  or  5.9-6.12)
+     *   open at 0x70 → ioctl = 0x50  (5.1-5.8)
+     * ------------------------------------------------------------------ */
+    {
+        uint64_t *def_fops = (uint64_t *)kallsyms_lookup_name("def_chr_fops");
+        uint64_t  chrdev_open_fn = kallsyms_lookup_name("chrdev_open");
+        int open_off = -1;
+
+        if (def_fops && chrdev_open_fn) {
+            for (int i = 2; i < 30; i++) {  /* skip owner/llseek */
+                if (def_fops[i] == chrdev_open_fn) {
+                    open_off = i * 8;
+                    break;
+                }
+            }
+        }
+
+        /* Fallback: try pipefifo_fops + pipe_write (available on most kernels) */
+        if (open_off < 0) {
+            uint64_t *pfops = (uint64_t *)kallsyms_lookup_name("pipefifo_fops");
+            uint64_t  pw_fn = kallsyms_lookup_name("pipe_write");
+            if (pfops && pw_fn) {
+                /* pipe_write is at the 'write' field = offset 0x18 on all versions.
+                 * write_iter is at 0x28. Check which slot has pipe_write. */
+                for (int i = 2; i < 10; i++) {
+                    if (pfops[i] == pw_fn) {
+                        /* write is always at 0x18 (slot 3). If we found it at
+                         * slot 3 => pre-field-insertion baseline matches.
+                         * The open field can be derived: on all versions,
+                         * open = write + (open_offset - 0x18).
+                         * But easier: scan for pipe_fopen or pipefifo_open. */
+                        uint64_t popen = kallsyms_lookup_name("fifo_open");
+                        if (!popen) popen = kallsyms_lookup_name("pipefifo_open");
+                        if (popen) {
+                            for (int j = 5; j < 30; j++) {
+                                if (pfops[j] == popen) {
+                                    open_off = j * 8;
+                                    break;
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (open_off > 0) {
+            /* open at 0x60 → no mmap_supported_flags → delta 0x18
+             * open at 0x68/0x70 → has mmap_supported_flags → delta 0x20 */
+            fops_ioctl_offset = (open_off <= 0x60)
+                                ? open_off - 0x18
+                                : open_off - 0x20;
+            printk(KERN_INFO "wanbai: probed open=0x%x → ioctl=0x%x\n",
+                   open_off, fops_ioctl_offset);
+        } else {
+            fops_ioctl_offset = 0x48; /* safe fallback for 4.14 */
+            printk(KERN_WARNING "wanbai: fops probe failed, defaulting ioctl=0x48\n");
+        }
+        fops_compat_offset = fops_ioctl_offset + 8;
+    }
+
     /* Allocate 4096 bytes each to guarantee ABI overflow margin */
     p_wanbai_fops = kp_kmalloc(4096, GFP_KERNEL);
     p_wanbai_dev  = kp_kmalloc(4096, GFP_KERNEL);
@@ -515,9 +752,9 @@ static long wanbai_init(const char *args, const char *event, void *__user rsv)
     char *p2 = (char *)p_wanbai_dev;
     for (int i = 0; i < 4096; i++) { p1[i] = 0; p2[i] = 0; }
 
-    /* Set up file_operations */
-    p_wanbai_fops->unlocked_ioctl = wanbai_ioctl;
-    p_wanbai_fops->compat_ioctl   = wanbai_ioctl;
+    /* Write ioctl function pointers at the probed offsets */
+    *(uint64_t *)(p1 + fops_ioctl_offset)  = (uint64_t)wanbai_ioctl;
+    *(uint64_t *)(p1 + fops_compat_offset) = (uint64_t)wanbai_ioctl;
 
     /* Set up miscdevice */
     p_wanbai_dev->minor = MISC_DYNAMIC_MINOR;
