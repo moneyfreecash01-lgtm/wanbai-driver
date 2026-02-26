@@ -67,9 +67,20 @@ struct device;
 #define MISC_DYNAMIC_MINOR 255
 
 /* -----------------------------------------------------------------------
- * file_operations ABI layout for arm64 Linux 4.x–6.x
- * Only defining fields up to and including compat_ioctl.
- * Zero-initialized globals are safe for fields we don't use.
+ * file_operations ABI layout for arm64 Linux 4.14 (NO iopoll field!)
+ *
+ * 4.14 layout (no iopoll – that was added in 5.1):
+ *   owner            0x00
+ *   llseek           0x08
+ *   read             0x10
+ *   write            0x18
+ *   read_iter        0x20
+ *   write_iter       0x28
+ *   iterate          0x30
+ *   iterate_shared   0x38
+ *   poll             0x40
+ *   unlocked_ioctl   0x48
+ *   compat_ioctl     0x50
  * --------------------------------------------------------------------- */
 struct kpm_file_operations {
     struct module    *owner;           /* 0x00 */
@@ -78,18 +89,17 @@ struct kpm_file_operations {
     void             *write;           /* 0x18 */
     void             *read_iter;       /* 0x20 */
     void             *write_iter;      /* 0x28 */
-    void             *iopoll;          /* 0x30 – added in 5.1, zero if absent */
-    void             *iterate;         /* 0x38 */
-    void             *iterate_shared;  /* 0x40 */
-    void             *poll;            /* 0x48 */
-    long (*unlocked_ioctl)(struct file *, unsigned int, unsigned long); /* 0x50 */
-    long (*compat_ioctl)(struct file *, unsigned int, unsigned long);   /* 0x58 */
+    /* NOTE: NO iopoll here — that field was added in 5.1+ */
+    void             *iterate;         /* 0x30 */
+    void             *iterate_shared;  /* 0x38 */
+    void             *poll;            /* 0x40 */
+    long (*unlocked_ioctl)(struct file *, unsigned int, unsigned long); /* 0x48 */
+    long (*compat_ioctl)(struct file *, unsigned int, unsigned long);   /* 0x50 */
     /* remaining fields zero = no-op */
-    void             *mmap;            /* 0x60 */
-    void             *mmap_supported_flags; /* 0x68 */
-    void             *open;           /* 0x70 */
-    void             *flush;          /* 0x78 */
-    void             *release;        /* 0x80 */
+    void             *mmap;            /* 0x58 */
+    void             *open;            /* 0x60 */
+    void             *flush;           /* 0x68 */
+    void             *release;         /* 0x70 */
 };
 
 /* miscdevice ABI layout for arm64 Linux 4.x–6.x */
@@ -351,6 +361,8 @@ static uint64_t module_base(int32_t pid, const char *name)
  * --------------------------------------------------------------------- */
 static long wanbai_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
+    printk(KERN_INFO "wanbai: ioctl cmd=0x%x arg=0x%lx\n", cmd, arg);
+
     switch (cmd) {
     case OP_INIT_KEY: {
         char key[0x100];
@@ -379,15 +391,28 @@ static long wanbai_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         return r;
     }
     case OP_MODULE_BASE: {
+        printk(KERN_INFO "wanbai: OP_MODULE_BASE hit\n");
         MODULE_BASE mb;
-        if (kp_copy_from_user(&mb, (void *)arg, sizeof(mb))) return -14;
+        long cfu_ret = kp_copy_from_user(&mb, (void *)arg, sizeof(mb));
+        if (cfu_ret) {
+            printk(KERN_INFO "wanbai: copy_from_user failed: %ld\n", cfu_ret);
+            return -14;
+        }
+        printk(KERN_INFO "wanbai: mb.pid=%d mb.name=0x%llx\n", mb.pid, mb.name);
         char nb[256];
-        if (kp_strncpy_from_user(nb, (char *)mb.name, sizeof(nb)) <= 0) return -14;
+        long sfu_ret = kp_strncpy_from_user(nb, (char *)mb.name, sizeof(nb));
+        if (sfu_ret <= 0) {
+            printk(KERN_INFO "wanbai: strncpy_from_user failed: %ld\n", sfu_ret);
+            return -14;
+        }
         nb[255] = '\0';
+        printk(KERN_INFO "wanbai: module name='%s'\n", nb);
         mb.base = module_base(mb.pid, nb);
         return kp_copy_to_user((void *)arg, &mb, sizeof(mb)) ? -14 : 0;
     }
-    default: return -25;
+    default:
+        printk(KERN_INFO "wanbai: unknown cmd=0x%x\n", cmd);
+        return -25;
     }
 }
 
