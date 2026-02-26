@@ -19,10 +19,10 @@
 #include <linux/printk.h>
 
 KPM_NAME("wanbai");
-KPM_VERSION("1.0.0");
-KPM_LICENSE("GPL v2");
+KPM_VERSION("2.0.1");
+KPM_LICENSE("ALL RIGHTS RESERVED BY ALEX5402");
 KPM_AUTHOR("@alex5402");
-KPM_DESCRIPTION("Universal KPM for 4.9 to 6.12 (/dev/wanbai)");
+KPM_DESCRIPTION("Universal KPM for 4.9 to 6.12 (/dev/wanbai) for support visit t.me/alex5402");
 
 #define OP_INIT_KEY     0x800
 #define OP_READ_MEM     0x801
@@ -210,8 +210,7 @@ static int probe_vm_file_offset(struct vm_area_struct *vma, struct mm_struct *mm
             continue;
         if (val == mm_val) {
             int file_off = off + 0x60;
-            printk(KERN_INFO "wanbai: probed vm_mm at 0x%x => vm_file at 0x%x\n",
-                   off, file_off);
+            printk(KERN_INFO "wanbai: probed vm_mm at 0x%x => vm_file at 0x%x\n", off, file_off);
             return file_off;
         }
     }
@@ -220,14 +219,7 @@ static int probe_vm_file_offset(struct vm_area_struct *vma, struct mm_struct *mm
     return 0xa0;
 }
 
-/* Inline strstr (bare-metal gcc emits kf_strstr libcall otherwise) */
-static void kpm_tolower(char *str) {
-    while (*str) {
-        if (*str >= 'A' && *str <= 'Z')
-            *str = *str + ('a' - 'A');
-        str++;
-    }
-}
+/* Inline char helpers (bare-metal gcc emits libcall otherwise) */
 static char kpm_tolower_char(char c) {
     if (c >= 'A' && c <= 'Z') return c + ('a' - 'A');
     return c;
@@ -391,8 +383,6 @@ static uint64_t module_base_vma(int32_t pid, const char *name)
         return 0;
     }
 
-    printk(KERN_INFO "wanbai: mm=%px first_vma=%px\n", mm, vma);
-
     /* Probe vm_file offset on first call */
     if (!vma_vm_file_off) {
         vma_vm_file_off = probe_vm_file_offset(vma, mm);
@@ -407,21 +397,20 @@ static uint64_t module_base_vma(int32_t pid, const char *name)
         void *filp = NULL;
         kp_safe_read(&filp, (char *)vma + vma_vm_file_off, sizeof(filp));
 
+#define DEBUG_VMA_WALK 0
         if (filp && !IS_ERR((void *)filp)) {
             const char *fname = dentry_name_from_file(filp, fname_buf, sizeof(fname_buf));
-            if (count <= 5) {
+#if DEBUG_VMA_WALK
+            if (count <= 10) {
                 printk(KERN_INFO "wanbai: VMA[%d] start=%llx filp=%px fname='%s'\n",
-                       count,
-                       *(uint64_t *)&vma, /* will be printed as pointer */
-                       filp,
-                       fname ? fname : "(null)");
+                       count, *(uint64_t *)&vma, filp, fname ? fname : "(null)");
             }
+#endif
             if (fname && kpm_str_ends_with(fname, name)) {
                 uint64_t vs = 0;
                 kp_safe_read(&vs, vma, sizeof(vs));
                 base = vs;
-                printk(KERN_INFO "wanbai: VMA match '%s' => base=%llx (count=%d)\n",
-                       fname, base, count);
+                printk(KERN_INFO "wanbai: VMA match '%s' => base=%llx (count=%d)\n", fname, base, count);
                 break;
             }
         }
@@ -432,7 +421,9 @@ static uint64_t module_base_vma(int32_t pid, const char *name)
         vma = (struct vm_area_struct *)next;
     }
 
-    printk(KERN_INFO "wanbai: VMA walk done, iterated %d VMAs, base=%llx\n", count, base);
+    if (!base) {
+        printk(KERN_INFO "wanbai: VMA walk finished (%d VMAs), base not found for %s\n", count, name);
+    }
     kp_mmput(mm);
     return base;
 }
