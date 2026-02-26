@@ -12,7 +12,7 @@ set -e
 #   ./build-kpm.sh demo-hello
 # ---------------------------------------------------------
 
-KPM_NAME="${1:-pubg_driver}"
+KPM_NAME="${1:-wanbai-driver}"
 KP_DIR="$(pwd)"
 
 # Default to the downloaded bare-metal compiler path in the compiler folder if no second argument is provided
