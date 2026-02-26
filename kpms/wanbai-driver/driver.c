@@ -124,10 +124,10 @@ typedef void                  (*t_put_pid)(struct pid *);
 typedef void                  (*t_put_task_struct)(struct task_struct *);
 typedef struct mm_struct     *(*t_get_task_mm)(struct task_struct *);
 typedef void                  (*t_mmput)(struct mm_struct *);
-typedef ssize_t               (*t_process_vm_rw)(struct task_struct *,
-                                                  const struct iovec *, uint64_t,
-                                                  const struct iovec *, uint64_t,
-                                                  uint64_t, int);
+typedef int                   (*t_access_process_vm)(struct task_struct *,
+                                                      unsigned long addr,
+                                                      void *buf, int len,
+                                                      unsigned int gup_flags);
 typedef int                   (*t_misc_register)(struct kpm_miscdevice *);
 typedef void                  (*t_misc_deregister)(struct kpm_miscdevice *);
 typedef void                 *(*t_kmalloc)(uint64_t, uint32_t);
@@ -145,7 +145,7 @@ static t_put_pid          kp_put_pid;
 static t_put_task_struct  kp_put_task_struct;
 static t_get_task_mm      kp_get_task_mm;
 static t_mmput            kp_mmput;
-static t_process_vm_rw    kp_process_vm_rw;
+static t_access_process_vm kp_access_process_vm;
 static t_misc_register    kp_misc_register;
 static t_misc_deregister  kp_misc_deregister;
 static t_kmalloc          kp_kmalloc;
@@ -172,7 +172,9 @@ static t_filp_close kp_filp_close;
 /* -----------------------------------------------------------------------
  * iovec for process_vm_rw
  * --------------------------------------------------------------------- */
-struct kpm_iovec { void *iov_base; uint64_t iov_len; };
+/* FOLL_FORCE for access_process_vm (bypass VMA permissions) */
+#define FOLL_FORCE  0x10
+#define FOLL_WRITE  0x01
 
 /* -----------------------------------------------------------------------
  * VMA walk offsets (arm64, common 4.x–6.x)
@@ -264,7 +266,9 @@ static void safe_put_task(struct task_struct *t)
 }
 
 /* -----------------------------------------------------------------------
- * Cross-process memory helper
+ * Cross-process memory helper using access_process_vm.
+ * Unlike process_vm_rw (which is a syscall backend using copy_from_user
+ * on iovec structs), access_process_vm works with kernel buffers directly.
  * --------------------------------------------------------------------- */
 static long xmem(int32_t pid, uint64_t addr, void *buf, uint64_t sz, int wr)
 {
@@ -273,14 +277,10 @@ static long xmem(int32_t pid, uint64_t addr, void *buf, uint64_t sz, int wr)
     struct task_struct *t = kp_get_pid_task(p, PIDTYPE_PID);
     kp_put_pid(p);
     if (!t) return -3;
-    struct kpm_iovec li = { buf,         sz };
-    struct kpm_iovec ri = { (void *)addr, sz };
-    ssize_t r = kp_process_vm_rw(t,
-                (const struct iovec *)&li, 1,
-                (const struct iovec *)&ri, 1,
-                0, wr);
+    unsigned int flags = FOLL_FORCE | (wr ? FOLL_WRITE : 0);
+    int done = kp_access_process_vm(t, (unsigned long)addr, buf, (int)sz, flags);
     safe_put_task(t);
-    return (r == (ssize_t)sz) ? 0 : -5;
+    return (done == (int)sz) ? 0 : -5;
 }
 
 /* -----------------------------------------------------------------------
@@ -390,7 +390,7 @@ static long wanbai_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         void *tmp = kp_kmalloc(cm.size, GFP_KERNEL);
         if (!tmp) return -12;
         long r = xmem(cm.pid, cm.addr, tmp, cm.size, 0);
-        if (!r && compat_copy_to_user((void *)cm.buffer, tmp, cm.size)) r = -14;
+        if (!r && kp_copy_to_user((void *)cm.buffer, tmp, cm.size)) r = -14;
         kp_kfree(tmp);
         return r;
     }
@@ -460,7 +460,7 @@ static long wanbai_init(const char *args, const char *event, void *__user rsv)
     RESOLVE(kp_put_task_struct, "__put_task_struct");
     RESOLVE(kp_get_task_mm,     "get_task_mm");
     RESOLVE(kp_mmput,           "mmput");
-    RESOLVE(kp_process_vm_rw,   "process_vm_rw");
+    RESOLVE(kp_access_process_vm, "access_process_vm");
     RESOLVE(kp_misc_register,   "misc_register");
     RESOLVE(kp_misc_deregister, "misc_deregister");
     RESOLVE(kp_kmalloc,         "__kmalloc");
