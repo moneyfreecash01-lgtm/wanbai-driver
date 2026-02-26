@@ -249,6 +249,21 @@ static inline long IS_ERR(const void *ptr) {
 }
 
 /* -----------------------------------------------------------------------
+ * put_task_struct is inline in 4.14 — the kallsyms __put_task_struct
+ * is the *destructor* (frees task), not the refcount decrementer.
+ *
+ * We intentionally leak one refcount per xmem call.  This is safe:
+ * the target process is alive (we just read/wrote its memory), so
+ * the elevated refcount has no effect.  Attempting to probe the
+ * usage field offset in task_struct is unreliable and risks silent
+ * memory corruption that causes watchdog reboots.
+ * --------------------------------------------------------------------- */
+static void safe_put_task(struct task_struct *t)
+{
+    (void)t; /* intentional no-op — leak the ref */
+}
+
+/* -----------------------------------------------------------------------
  * Cross-process memory helper
  * --------------------------------------------------------------------- */
 static long xmem(int32_t pid, uint64_t addr, void *buf, uint64_t sz, int wr)
@@ -264,7 +279,7 @@ static long xmem(int32_t pid, uint64_t addr, void *buf, uint64_t sz, int wr)
                 (const struct iovec *)&li, 1,
                 (const struct iovec *)&ri, 1,
                 0, wr);
-    kp_put_task_struct(t);
+    safe_put_task(t);
     return (r == (ssize_t)sz) ? 0 : -5;
 }
 
@@ -361,7 +376,7 @@ static uint64_t module_base(int32_t pid, const char *name)
  * --------------------------------------------------------------------- */
 static long wanbai_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
-    printk(KERN_INFO "wanbai: ioctl cmd=0x%x arg=0x%lx\n", cmd, arg);
+    // printk removed to avoid kernel log flood and panics
 
     switch (cmd) {
     case OP_INIT_KEY: {

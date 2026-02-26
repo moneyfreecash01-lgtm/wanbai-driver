@@ -10,7 +10,7 @@ CC = $(TARGET_COMPILE)gcc
 LD = $(TARGET_COMPILE)ld
 
 # Must match kernel/Makefile: no system includes, no builtins, aarch64-bare-metal
-KPM_CFLAGS := -Wall -fno-builtin -std=gnu11 -nostdinc -mgeneral-regs-only -O2
+KPM_CFLAGS := -Wall -fno-builtin -std=gnu11 -nostdinc -mgeneral-regs-only -mno-outline-atomics -O2
 
 INCLUDE_DIRS := . include patch/include linux/include linux/arch/arm64/include linux/tools/arch/arm64/include
 
