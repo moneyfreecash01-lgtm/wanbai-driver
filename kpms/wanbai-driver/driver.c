@@ -22,7 +22,7 @@ KPM_NAME("wanbai");
 KPM_VERSION("1.0.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("pubg-cheat");
-KPM_DESCRIPTION("Kernel memory driver for PUBG overlay cheat (/dev/wanbai)");
+KPM_DESCRIPTION("Kernel memory driver for 4.9 to 6.12 (/dev/wanbai)");
 
 #define OP_INIT_KEY     0x800
 #define OP_READ_MEM     0x801
