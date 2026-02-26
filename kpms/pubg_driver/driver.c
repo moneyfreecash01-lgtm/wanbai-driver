@@ -29,18 +29,23 @@ KPM_DESCRIPTION("Kernel memory driver for PUBG overlay cheat (/dev/wanbai)");
 #define OP_WRITE_MEM    0x802
 #define OP_MODULE_BASE  0x803
 
+/* Matches userspace COPY_MEMORY: pid_t(4) + pad(4) + uintptr_t(8) + void*(8) + size_t(8) */
 typedef struct {
     int32_t   pid;
+    uint32_t  _pad;
     uint64_t  addr;
     uint64_t  buffer;
     uint64_t  size;
-} __attribute__((packed)) COPY_MEMORY;
+} COPY_MEMORY;
 
+/* Matches userspace MODULE_BASE: pid_t(4) + pad(4) + char*(8) + uintptr_t(8) */
 typedef struct {
     int32_t   pid;
-    uint64_t  name;
+    uint32_t  _pad;
+    uint64_t  name;   /* userspace char* pointer */
     uint64_t  base;
-} __attribute__((packed)) MODULE_BASE;
+} MODULE_BASE;
+
 
 /* Opaque types */
 struct task_struct;
@@ -137,10 +142,22 @@ static t_kmalloc          kp_kmalloc;
 static t_kfree            kp_kfree;
 static t_get_zeroed_page  kp_get_zeroed_page;
 static t_free_pages       kp_free_pages;
-static t_d_path           kp_d_path;
-static t_down_read        kp_down_read;
-static t_up_read          kp_up_read;
 static t_copy_from_user   kp_copy_from_user;
+static t_copy_from_user   kp_copy_to_user; /* Signature is identical */
+typedef long (*t_strncpy_from_user)(char *, const char *, long);
+static t_strncpy_from_user kp_strncpy_from_user;
+
+typedef int (*t_snprintf)(char *buf, size_t size, const char *fmt, ...);
+static t_snprintf kp_snprintf;
+
+typedef struct file *(*t_filp_open)(const char *filename, int flags, int mode);
+static t_filp_open kp_filp_open;
+
+typedef ssize_t (*t_kernel_read)(struct file *file, void *buf, size_t count, loff_t *pos);
+static t_kernel_read kp_kernel_read;
+
+typedef int (*t_filp_close)(struct file *file, void *id);
+static t_filp_close kp_filp_close;
 
 /* -----------------------------------------------------------------------
  * iovec for process_vm_rw
@@ -178,15 +195,47 @@ static inline struct path *file_path(void *filp)
 }
 
 /* Inline strstr (bare-metal gcc emits kf_strstr libcall otherwise) */
-static const char *kpm_strstr(const char *h, const char *n)
-{
-    if (!*n) return h;
-    for (; *h; h++) {
-        const char *a = h, *b = n;
-        while (*a && *b && *a == *b) { a++; b++; }
-        if (!*b) return h;
+static void kpm_tolower(char *str) {
+    while (*str) {
+        if (*str >= 'A' && *str <= 'Z')
+            *str = *str + ('a' - 'A');
+        str++;
     }
-    return 0;
+}
+static char kpm_tolower_char(char c) {
+    if (c >= 'A' && c <= 'Z') return c + ('a' - 'A');
+    return c;
+}
+static char *kpm_strcasestr(const char *haystack, const char *needle) {
+    if (!*needle) return (char *)haystack;
+    for (; *haystack; haystack++) {
+        if (kpm_tolower_char(*haystack) == kpm_tolower_char(*needle)) {
+            const char *h, *n;
+            for (h = haystack, n = needle; *h && *n; h++, n++) {
+                if (kpm_tolower_char(*h) != kpm_tolower_char(*n)) break;
+            }
+            if (!*n) return (char *)haystack;
+        }
+    }
+    return NULL;
+}
+static char *kpm_strchr(const char *s, int c) {
+    while (*s != (char)c) {
+        if (!*s++) return NULL;
+    }
+    return (char *)s;
+}
+static size_t kpm_strlen(const char *s) {
+    const char *sc = s;
+    for (; *sc != '\0'; ++sc) /* nothing */;
+    return sc - s;
+}
+
+/* Helper to check for error pointers */
+#define MAX_ERRNO 4095
+#define IS_ERR_VALUE(x) ((unsigned long)(void *)(x) >= (unsigned long)-MAX_ERRNO)
+static inline long IS_ERR(const void *ptr) {
+    return IS_ERR_VALUE((unsigned long)ptr);
 }
 
 /* -----------------------------------------------------------------------
@@ -214,37 +263,88 @@ static long xmem(int32_t pid, uint64_t addr, void *buf, uint64_t sz, int wr)
  * --------------------------------------------------------------------- */
 static uint64_t module_base(int32_t pid, const char *name)
 {
-    struct pid *p = kp_find_get_pid(pid);
-    if (!p) return 0;
-    struct task_struct *t = kp_get_pid_task(p, PIDTYPE_PID);
-    kp_put_pid(p);
-    if (!t) return 0;
-    struct mm_struct *mm = kp_get_task_mm(t);
-    kp_put_task_struct(t);
-    if (!mm) return 0;
-
-    char *pg = (char *)kp_get_zeroed_page(GFP_ATOMIC);
-    if (!pg) { kp_mmput(mm); return 0; }
-
-    kp_down_read((char *)mm + MM_MMAP_LOCK_OFFSET);
-
+    char path[64];
+    struct file *f;
+    char *buf;
+    loff_t pos = 0;
     uint64_t base = 0;
-    for (struct vm_area_struct *v = mm_mmap(mm); v; v = vma_vm_next(v)) {
-        void *f = vma_vm_file(v);
-        if (!f) continue;
-        char *path = kp_d_path(file_path(f), pg, PAGE_SIZE);
-        if ((uint64_t)path > (uint64_t)-4096ULL) continue;
-        const char *fname = path, *sl = 0;
-        for (const char *c = path; *c; c++) if (*c == '/') sl = c;
-        if (sl) fname = sl + 1;
-        if (kpm_strstr(fname, name)) { base = vma_vm_start(v); break; }
+
+    printk(KERN_INFO "wanbai: module_base called pid=%d name=%s\n", pid, name);
+
+    if (!kp_snprintf || !kp_filp_open || !kp_kernel_read || !kp_filp_close) {
+        printk(KERN_INFO "wanbai: module_base missing kfuncs: snprintf=%p filp_open=%p kernel_read=%p filp_close=%p\n",
+               kp_snprintf, kp_filp_open, kp_kernel_read, kp_filp_close);
+        return 0;
     }
 
-    kp_up_read((char *)mm + MM_MMAP_LOCK_OFFSET);
-    kp_free_pages((uint64_t)pg, 0);
-    kp_mmput(mm);
+    kp_snprintf(path, sizeof(path), "/proc/%d/maps", pid);
+    printk(KERN_INFO "wanbai: opening %s\n", path);
+
+    f = kp_filp_open(path, 0, 0); /* O_RDONLY = 0 */
+    if (IS_ERR(f)) {
+        printk(KERN_INFO "wanbai: failed to open %s err=%ld\n", path, (long)(f));
+        return 0;
+    }
+    printk(KERN_INFO "wanbai: %s opened OK\n", path);
+
+    buf = kp_kmalloc(PAGE_SIZE + 1, GFP_KERNEL);
+    if (!buf) {
+        kp_filp_close(f, 0);
+        return 0;
+    }
+
+    int chunk = 0;
+    while (1) {
+        ssize_t bytes = kp_kernel_read(f, buf, PAGE_SIZE, &pos);
+        if (bytes <= 0) {
+            printk(KERN_INFO "wanbai: kernel_read chunk=%d bytes=%ld (done or error)\n", chunk, (long)bytes);
+            break;
+        }
+        if (chunk == 0)
+            printk(KERN_INFO "wanbai: first 64 bytes: %.64s\n", buf);
+        chunk++;
+        buf[bytes] = '\0';
+
+        char *line = buf;
+        while (line && *line) {
+            char *nl = kpm_strchr(line, '\n');
+            if (nl) *nl = '\0';
+
+            if (kpm_strcasestr(line, name)) {
+                uint64_t val = 0;
+                char *p = line;
+                while (*p) {
+                    char c = *p++;
+                    if (c >= '0' && c <= '9') val = (val << 4) | (c - '0');
+                    else if (c >= 'a' && c <= 'f') val = (val << 4) | (c - 'a' + 10);
+                    else if (c >= 'A' && c <= 'F') val = (val << 4) | (c - 'A' + 10);
+                    else break;
+                }
+                base = val;
+                printk(KERN_INFO "wanbai: found '%s' in line => base=%llx\n", name, base);
+                break;
+            }
+
+            if (!nl) {
+                if (bytes == PAGE_SIZE) {
+                    int len = kpm_strlen(line);
+                    if (len < PAGE_SIZE) {
+                        pos -= len;
+                    }
+                }
+                break;
+            }
+            line = nl + 1;
+        }
+        if (base) break;
+    }
+
+    kp_kfree(buf);
+    kp_filp_close(f, 0);
+    printk(KERN_INFO "wanbai: module_base result for %s = %llx\n", name, base);
     return base;
 }
+
 
 /* -----------------------------------------------------------------------
  * ioctl handler
@@ -282,10 +382,10 @@ static long wanbai_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         MODULE_BASE mb;
         if (kp_copy_from_user(&mb, (void *)arg, sizeof(mb))) return -14;
         char nb[256];
-        if (compat_strncpy_from_user(nb, (char *)mb.name, sizeof(nb)) <= 0) return -14;
+        if (kp_strncpy_from_user(nb, (char *)mb.name, sizeof(nb)) <= 0) return -14;
         nb[255] = '\0';
         mb.base = module_base(mb.pid, nb);
-        return compat_copy_to_user((void *)arg, &mb, sizeof(mb)) ? -14 : 0;
+        return kp_copy_to_user((void *)arg, &mb, sizeof(mb)) ? -14 : 0;
     }
     default: return -25;
     }
@@ -327,17 +427,28 @@ static long wanbai_init(const char *args, const char *event, void *__user rsv)
     RESOLVE(kp_kfree,           "kfree");
     RESOLVE(kp_get_zeroed_page, "get_zeroed_page");
     RESOLVE(kp_free_pages,      "free_pages");
-    RESOLVE(kp_d_path,          "d_path");
-    RESOLVE(kp_down_read,       "down_read");
-    RESOLVE(kp_up_read,         "up_read");
+
+    kp_snprintf = (t_snprintf)kallsyms_lookup_name("snprintf");
+    kp_filp_open = (t_filp_open)kallsyms_lookup_name("filp_open");
+    kp_kernel_read = (t_kernel_read)kallsyms_lookup_name("kernel_read");
+    kp_filp_close = (t_filp_close)kallsyms_lookup_name("filp_close");
 
     /* copy_from_user depends on arm64 kernel version */
     kp_copy_from_user = (t_copy_from_user)kallsyms_lookup_name("_copy_from_user");
-    if (!kp_copy_from_user) {
-        kp_copy_from_user = (t_copy_from_user)kallsyms_lookup_name("__arch_copy_from_user");
-    }
-    if (!kp_copy_from_user) {
+    if (!kp_copy_from_user) kp_copy_from_user = (t_copy_from_user)kallsyms_lookup_name("__arch_copy_from_user");
+
+    kp_copy_to_user = (t_copy_from_user)kallsyms_lookup_name("_copy_to_user");
+    if (!kp_copy_to_user) kp_copy_to_user = (t_copy_from_user)kallsyms_lookup_name("__arch_copy_to_user");
+
+    kp_strncpy_from_user = (t_strncpy_from_user)kallsyms_lookup_name("strncpy_from_user");
+
+    if (!kp_copy_from_user || !kp_copy_to_user) {
         printk(KERN_ERR "wanbai: missing: [__arch]_copy_from_user\n");
+        missing++;
+    }
+
+    if (!kp_strncpy_from_user) {
+        printk(KERN_ERR "wanbai: missing: strncpy_from_user\n");
         missing++;
     }
 
