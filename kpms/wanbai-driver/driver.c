@@ -18,8 +18,8 @@
 #include <ktypes.h>
 #include <linux/printk.h>
 
-KPM_NAME("wanbai");
-KPM_VERSION("2.0.1");
+KPM_NAME("Universal ioctl driver");
+KPM_VERSION("2.0.2");
 KPM_LICENSE("ALL RIGHTS RESERVED BY ALEX5402");
 KPM_AUTHOR("@alex5402");
 KPM_DESCRIPTION("Universal ioctl driver supports Gt driver, dit-driver, dit pro driver,  wanbai driver, LDG kpm driver, for 4.9 to 6.12 (/dev/wanbai) for support visit t.me/alex5402");
