@@ -18,7 +18,7 @@
 #include <ktypes.h>
 #include <linux/printk.h>
 
-KPM_NAME("Universal ioctl driver");
+KPM_NAME("universal-ioctl-river");
 KPM_VERSION("2.0.2");
 KPM_LICENSE("ALL RIGHTS RESERVED BY ALEX5402");
 KPM_AUTHOR("@alex5402");
