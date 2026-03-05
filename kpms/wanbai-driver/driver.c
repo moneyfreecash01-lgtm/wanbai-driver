@@ -18,8 +18,8 @@
 #include <ktypes.h>
 #include <linux/printk.h>
 
-KPM_NAME("universal-ioctl-river");
-KPM_VERSION("2.0.2");
+KPM_NAME("universal-ioctl-driver");
+KPM_VERSION("2.0.5");
 KPM_LICENSE("ALL RIGHTS RESERVED BY ALEX5402");
 KPM_AUTHOR("@alex5402");
 KPM_DESCRIPTION("Universal ioctl driver supports Gt driver, dit-driver, dit pro driver,  wanbai driver, LDG kpm driver, for 4.9 to 6.12 (/dev/wanbai) for support visit t.me/alex5402");
@@ -279,14 +279,29 @@ static void safe_put_task(struct task_struct *t)
 static long xmem(int32_t pid, uint64_t addr, void *buf, uint64_t sz, int wr)
 {
     struct pid *p = kp_find_get_pid(pid);
-    if (!p) return -3;
+    if (!p) {
+        printk(KERN_ERR "wanbai: xmem: find_get_pid(%d) returned NULL\n", pid);
+        return -3;
+    }
     struct task_struct *t = kp_get_pid_task(p, PIDTYPE_PID);
     kp_put_pid(p);
-    if (!t) return -3;
+    if (!t) {
+        printk(KERN_ERR "wanbai: xmem: get_pid_task(%d) returned NULL\n", pid);
+        return -3;
+    }
     unsigned int flags = FOLL_FORCE | (wr ? FOLL_WRITE : 0);
+    printk(KERN_DEBUG "wanbai: xmem: pid=%d addr=%llx sz=%llu wr=%d flags=0x%x\n",
+           pid, addr, sz, wr, flags);
     int done = kp_access_process_vm(t, (unsigned long)addr, buf, (int)sz, flags);
     safe_put_task(t);
-    return (done == (int)sz) ? 0 : -5;
+    if (done != (int)sz) {
+        printk(KERN_ERR "wanbai: xmem: access_process_vm FAILED: requested=%llu got=%d (pid=%d addr=%llx wr=%d)\n",
+               sz, done, pid, addr, wr);
+        return -5;
+    }
+    printk(KERN_DEBUG "wanbai: xmem: SUCCESS pid=%d addr=%llx sz=%llu wr=%d\n",
+           pid, addr, sz, wr);
+    return 0;
 }
 
 /* -----------------------------------------------------------------------
@@ -524,32 +539,89 @@ static uint64_t module_base(int32_t pid, const char *name)
  * --------------------------------------------------------------------- */
 static long wanbai_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
-    // printk removed to avoid kernel log flood and panics
+    printk(KERN_DEBUG "wanbai: ioctl cmd=0x%x arg=0x%lx\n", cmd, arg);
 
     switch (cmd) {
     case OP_INIT_KEY: {
+        printk(KERN_INFO "wanbai: OP_INIT_KEY hit\n");
         char key[0x100];
-        return kp_copy_from_user(key, (void *)arg, sizeof(key)) ? -14 : 0;
+        long ret = kp_copy_from_user(key, (void *)arg, sizeof(key));
+        if (ret) {
+            printk(KERN_ERR "wanbai: OP_INIT_KEY copy_from_user failed: %ld\n", ret);
+            return -14;
+        }
+        printk(KERN_INFO "wanbai: OP_INIT_KEY success\n");
+        return 0;
     }
     case OP_READ_MEM: {
         COPY_MEMORY cm;
-        if (kp_copy_from_user(&cm, (void *)arg, sizeof(cm))) return -14;
-        if (!cm.size || cm.size > 0x1000000ULL) return -22;
+        long cfu = kp_copy_from_user(&cm, (void *)arg, sizeof(cm));
+        if (cfu) {
+            printk(KERN_ERR "wanbai: OP_READ_MEM copy_from_user(COPY_MEMORY) failed: %ld\n", cfu);
+            return -14;
+        }
+        printk(KERN_INFO "wanbai: OP_READ_MEM pid=%d addr=0x%llx buf=0x%llx size=%llu\n",
+               cm.pid, cm.addr, cm.buffer, cm.size);
+        if (!cm.size || cm.size > 0x1000000ULL) {
+            printk(KERN_ERR "wanbai: OP_READ_MEM invalid size=%llu\n", cm.size);
+            return -22;
+        }
         void *tmp = kp_kmalloc(cm.size, GFP_KERNEL);
-        if (!tmp) return -12;
+        if (!tmp) {
+            printk(KERN_ERR "wanbai: OP_READ_MEM kmalloc(%llu) FAILED (OOM)\n", cm.size);
+            return -12;
+        }
         long r = xmem(cm.pid, cm.addr, tmp, cm.size, 0);
-        if (!r && kp_copy_to_user((void *)cm.buffer, tmp, cm.size)) r = -14;
+        if (r) {
+            printk(KERN_ERR "wanbai: OP_READ_MEM xmem read FAILED: %ld (pid=%d addr=0x%llx size=%llu)\n",
+                   r, cm.pid, cm.addr, cm.size);
+            kp_kfree(tmp);
+            return r;
+        }
+        if (kp_copy_to_user((void *)cm.buffer, tmp, cm.size)) {
+            printk(KERN_ERR "wanbai: OP_READ_MEM copy_to_user FAILED (buf=0x%llx size=%llu)\n",
+                   cm.buffer, cm.size);
+            kp_kfree(tmp);
+            return -14;
+        }
+        printk(KERN_DEBUG "wanbai: OP_READ_MEM success pid=%d addr=0x%llx size=%llu\n",
+               cm.pid, cm.addr, cm.size);
         kp_kfree(tmp);
-        return r;
+        return 0;
     }
     case OP_WRITE_MEM: {
         COPY_MEMORY cm;
-        if (kp_copy_from_user(&cm, (void *)arg, sizeof(cm))) return -14;
-        if (!cm.size || cm.size > 0x1000000ULL) return -22;
+        long cfu = kp_copy_from_user(&cm, (void *)arg, sizeof(cm));
+        if (cfu) {
+            printk(KERN_ERR "wanbai: OP_WRITE_MEM copy_from_user(COPY_MEMORY) failed: %ld\n", cfu);
+            return -14;
+        }
+        printk(KERN_INFO "wanbai: OP_WRITE_MEM pid=%d addr=0x%llx buf=0x%llx size=%llu\n",
+               cm.pid, cm.addr, cm.buffer, cm.size);
+        if (!cm.size || cm.size > 0x1000000ULL) {
+            printk(KERN_ERR "wanbai: OP_WRITE_MEM invalid size=%llu\n", cm.size);
+            return -22;
+        }
         void *tmp = kp_kmalloc(cm.size, GFP_KERNEL);
-        if (!tmp) return -12;
-        long r = kp_copy_from_user(tmp, (void *)cm.buffer, cm.size)
-                 ? -14 : xmem(cm.pid, cm.addr, tmp, cm.size, 1);
+        if (!tmp) {
+            printk(KERN_ERR "wanbai: OP_WRITE_MEM kmalloc(%llu) FAILED (OOM)\n", cm.size);
+            return -12;
+        }
+        long cfu2 = kp_copy_from_user(tmp, (void *)cm.buffer, cm.size);
+        if (cfu2) {
+            printk(KERN_ERR "wanbai: OP_WRITE_MEM copy_from_user(data) FAILED: %ld (buf=0x%llx size=%llu)\n",
+                   cfu2, cm.buffer, cm.size);
+            kp_kfree(tmp);
+            return -14;
+        }
+        long r = xmem(cm.pid, cm.addr, tmp, cm.size, 1);
+        if (r) {
+            printk(KERN_ERR "wanbai: OP_WRITE_MEM xmem write FAILED: %ld (pid=%d addr=0x%llx size=%llu)\n",
+                   r, cm.pid, cm.addr, cm.size);
+        } else {
+            printk(KERN_DEBUG "wanbai: OP_WRITE_MEM success pid=%d addr=0x%llx size=%llu\n",
+                   cm.pid, cm.addr, cm.size);
+        }
         kp_kfree(tmp);
         return r;
     }
@@ -558,23 +630,29 @@ static long wanbai_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         MODULE_BASE mb;
         long cfu_ret = kp_copy_from_user(&mb, (void *)arg, sizeof(mb));
         if (cfu_ret) {
-            printk(KERN_INFO "wanbai: copy_from_user failed: %ld\n", cfu_ret);
+            printk(KERN_ERR "wanbai: OP_MODULE_BASE copy_from_user failed: %ld\n", cfu_ret);
             return -14;
         }
         printk(KERN_INFO "wanbai: mb.pid=%d mb.name=0x%llx\n", mb.pid, mb.name);
         char nb[256];
         long sfu_ret = kp_strncpy_from_user(nb, (char *)mb.name, sizeof(nb));
         if (sfu_ret <= 0) {
-            printk(KERN_INFO "wanbai: strncpy_from_user failed: %ld\n", sfu_ret);
+            printk(KERN_ERR "wanbai: OP_MODULE_BASE strncpy_from_user failed: %ld\n", sfu_ret);
             return -14;
         }
         nb[255] = '\0';
         printk(KERN_INFO "wanbai: module name='%s'\n", nb);
         mb.base = module_base(mb.pid, nb);
-        return kp_copy_to_user((void *)arg, &mb, sizeof(mb)) ? -14 : 0;
+        long ctu_ret = kp_copy_to_user((void *)arg, &mb, sizeof(mb));
+        if (ctu_ret) {
+            printk(KERN_ERR "wanbai: OP_MODULE_BASE copy_to_user failed: %ld\n", ctu_ret);
+            return -14;
+        }
+        printk(KERN_INFO "wanbai: OP_MODULE_BASE result base=0x%llx\n", mb.base);
+        return 0;
     }
     default:
-        printk(KERN_INFO "wanbai: unknown cmd=0x%x\n", cmd);
+        printk(KERN_WARNING "wanbai: unknown cmd=0x%x\n", cmd);
         return -25;
     }
 }
