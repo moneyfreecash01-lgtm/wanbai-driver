@@ -19,7 +19,7 @@
 #include <linux/printk.h>
 
 KPM_NAME("universal-ioctl-driver");
-KPM_VERSION("2.0.5");
+KPM_VERSION("2.0.6");
 KPM_LICENSE("ALL RIGHTS RESERVED BY ALEX5402");
 KPM_AUTHOR("@alex5402");
 KPM_DESCRIPTION("Universal ioctl driver supports Gt driver, dit-driver, dit pro driver,  wanbai driver, LDG kpm driver, for 4.9 to 6.12 (/dev/wanbai) for support visit t.me/alex5402");
@@ -210,12 +210,10 @@ static int probe_vm_file_offset(struct vm_area_struct *vma, struct mm_struct *mm
             continue;
         if (val == mm_val) {
             int file_off = off + 0x60;
-            printk(KERN_INFO "wanbai: probed vm_mm at 0x%x => vm_file at 0x%x\n", off, file_off);
             return file_off;
         }
     }
     /* Fallback: try common offsets */
-    printk(KERN_INFO "wanbai: vm_mm probe failed, trying default vm_file=0xa0\n");
     return 0xa0;
 }
 
@@ -290,8 +288,6 @@ static long xmem(int32_t pid, uint64_t addr, void *buf, uint64_t sz, int wr)
         return -3;
     }
     unsigned int flags = FOLL_FORCE | (wr ? FOLL_WRITE : 0);
-    printk(KERN_DEBUG "wanbai: xmem: pid=%d addr=%llx sz=%llu wr=%d flags=0x%x\n",
-           pid, addr, sz, wr, flags);
     int done = kp_access_process_vm(t, (unsigned long)addr, buf, (int)sz, flags);
     safe_put_task(t);
     if (done != (int)sz) {
@@ -299,8 +295,6 @@ static long xmem(int32_t pid, uint64_t addr, void *buf, uint64_t sz, int wr)
                sz, done, pid, addr, wr);
         return -5;
     }
-    printk(KERN_DEBUG "wanbai: xmem: SUCCESS pid=%d addr=%llx sz=%llu wr=%d\n",
-           pid, addr, sz, wr);
     return 0;
 }
 
@@ -379,13 +373,12 @@ static uint64_t module_base_vma(int32_t pid, const char *name)
     struct mm_struct *mm = kp_get_task_mm(t);
     safe_put_task(t);
     if (!mm) {
-        printk(KERN_INFO "wanbai: get_task_mm failed for pid=%d\n", pid);
         return 0;
     }
 
     /* We MUST use safe reads (nofault) because we don't hold mmap_lock. */
     if (!kp_probe_kernel_read && !kp_copy_from_kernel_nofault) {
-        printk(KERN_INFO "wanbai: VMA walk missing safe read functions!\n");
+        printk(KERN_ERR "wanbai: VMA walk missing safe read functions!\n");
         kp_mmput(mm);
         return 0;
     }
@@ -393,7 +386,6 @@ static uint64_t module_base_vma(int32_t pid, const char *name)
     /* Safely read mm->mmap (first field of mm_struct) */
     struct vm_area_struct *vma = NULL;
     if (kp_safe_read(&vma, (char *)mm + MM_MMAP_OFFSET, sizeof(vma)) || !vma) {
-        printk(KERN_INFO "wanbai: mm->mmap is NULL or unreadable (mm=%px)\n", mm);
         kp_mmput(mm);
         return 0;
     }
@@ -425,7 +417,6 @@ static uint64_t module_base_vma(int32_t pid, const char *name)
                 uint64_t vs = 0;
                 kp_safe_read(&vs, vma, sizeof(vs));
                 base = vs;
-                printk(KERN_INFO "wanbai: VMA match '%s' => base=%llx (count=%d)\n", fname, base, count);
                 break;
             }
         }
@@ -437,7 +428,6 @@ static uint64_t module_base_vma(int32_t pid, const char *name)
     }
 
     if (!base) {
-        printk(KERN_INFO "wanbai: VMA walk finished (%d VMAs), base not found for %s\n", count, name);
     }
     kp_mmput(mm);
     return base;
@@ -447,35 +437,29 @@ static uint64_t module_base_vma(int32_t pid, const char *name)
 static uint64_t module_base(int32_t pid, const char *name)
 {
     uint64_t base = 0;
-    printk(KERN_INFO "wanbai: module_base called pid=%d name=%s\n", pid, name);
 
     /* Method 1: direct VMA walk (works on all kernels 4.9-6.x) */
     if (kp_get_task_mm && kp_mmput) {
         base = module_base_vma(pid, name);
         if (base) {
-            printk(KERN_INFO "wanbai: module_base result for %s = %llx (VMA walk)\n",
-                   name, base);
             return base;
         }
-        printk(KERN_INFO "wanbai: VMA walk found nothing, trying /proc/maps...\n");
     }
 
     /* Method 2: /proc/maps reading (works on 4.x kernels with set_fs) */
     if (!kp_snprintf || !kp_filp_open || !kp_filp_close) {
-        printk(KERN_INFO "wanbai: module_base: no file I/O funcs available\n");
+        printk(KERN_ERR "wanbai: module_base: no file I/O funcs available\n");
         return 0;
     }
 
     char path[64];
     kp_snprintf(path, sizeof(path), "/proc/%d/maps", pid);
-    printk(KERN_INFO "wanbai: opening %s\n", path);
 
     struct file *f = kp_filp_open(path, 0, 0);
     if (IS_ERR(f)) {
-        printk(KERN_INFO "wanbai: failed to open %s err=%ld\n", path, (long)(f));
+        printk(KERN_ERR "wanbai: failed to open %s err=%ld\n", path, (long)(f));
         return 0;
     }
-    printk(KERN_INFO "wanbai: %s opened OK\n", path);
 
     char *buf = kp_kmalloc(PAGE_SIZE + 1, GFP_KERNEL);
     if (!buf) { kp_filp_close(f, 0); return 0; }
@@ -491,8 +475,6 @@ static uint64_t module_base(int32_t pid, const char *name)
         if (bytes <= 0 && kp_vfs_read)
             bytes = kp_vfs_read(f, buf, PAGE_SIZE, &pos);
         if (bytes <= 0) {
-            printk(KERN_INFO "wanbai: kernel_read chunk=%d bytes=%ld (done or error)\n",
-                   chunk, (long)bytes);
             break;
         }
         chunk++;
@@ -529,7 +511,6 @@ static uint64_t module_base(int32_t pid, const char *name)
 
     kp_kfree(buf);
     kp_filp_close(f, 0);
-    printk(KERN_INFO "wanbai: module_base result for %s = %llx\n", name, base);
     return base;
 }
 
@@ -539,18 +520,14 @@ static uint64_t module_base(int32_t pid, const char *name)
  * --------------------------------------------------------------------- */
 static long wanbai_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
-    printk(KERN_DEBUG "wanbai: ioctl cmd=0x%x arg=0x%lx\n", cmd, arg);
-
     switch (cmd) {
     case OP_INIT_KEY: {
-        printk(KERN_INFO "wanbai: OP_INIT_KEY hit\n");
         char key[0x100];
         long ret = kp_copy_from_user(key, (void *)arg, sizeof(key));
         if (ret) {
             printk(KERN_ERR "wanbai: OP_INIT_KEY copy_from_user failed: %ld\n", ret);
             return -14;
         }
-        printk(KERN_INFO "wanbai: OP_INIT_KEY success\n");
         return 0;
     }
     case OP_READ_MEM: {
@@ -560,8 +537,6 @@ static long wanbai_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
             printk(KERN_ERR "wanbai: OP_READ_MEM copy_from_user(COPY_MEMORY) failed: %ld\n", cfu);
             return -14;
         }
-        printk(KERN_INFO "wanbai: OP_READ_MEM pid=%d addr=0x%llx buf=0x%llx size=%llu\n",
-               cm.pid, cm.addr, cm.buffer, cm.size);
         if (!cm.size || cm.size > 0x1000000ULL) {
             printk(KERN_ERR "wanbai: OP_READ_MEM invalid size=%llu\n", cm.size);
             return -22;
@@ -584,8 +559,6 @@ static long wanbai_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
             kp_kfree(tmp);
             return -14;
         }
-        printk(KERN_DEBUG "wanbai: OP_READ_MEM success pid=%d addr=0x%llx size=%llu\n",
-               cm.pid, cm.addr, cm.size);
         kp_kfree(tmp);
         return 0;
     }
@@ -596,8 +569,6 @@ static long wanbai_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
             printk(KERN_ERR "wanbai: OP_WRITE_MEM copy_from_user(COPY_MEMORY) failed: %ld\n", cfu);
             return -14;
         }
-        printk(KERN_INFO "wanbai: OP_WRITE_MEM pid=%d addr=0x%llx buf=0x%llx size=%llu\n",
-               cm.pid, cm.addr, cm.buffer, cm.size);
         if (!cm.size || cm.size > 0x1000000ULL) {
             printk(KERN_ERR "wanbai: OP_WRITE_MEM invalid size=%llu\n", cm.size);
             return -22;
@@ -618,22 +589,17 @@ static long wanbai_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         if (r) {
             printk(KERN_ERR "wanbai: OP_WRITE_MEM xmem write FAILED: %ld (pid=%d addr=0x%llx size=%llu)\n",
                    r, cm.pid, cm.addr, cm.size);
-        } else {
-            printk(KERN_DEBUG "wanbai: OP_WRITE_MEM success pid=%d addr=0x%llx size=%llu\n",
-                   cm.pid, cm.addr, cm.size);
         }
         kp_kfree(tmp);
         return r;
     }
     case OP_MODULE_BASE: {
-        printk(KERN_INFO "wanbai: OP_MODULE_BASE hit\n");
         MODULE_BASE mb;
         long cfu_ret = kp_copy_from_user(&mb, (void *)arg, sizeof(mb));
         if (cfu_ret) {
             printk(KERN_ERR "wanbai: OP_MODULE_BASE copy_from_user failed: %ld\n", cfu_ret);
             return -14;
         }
-        printk(KERN_INFO "wanbai: mb.pid=%d mb.name=0x%llx\n", mb.pid, mb.name);
         char nb[256];
         long sfu_ret = kp_strncpy_from_user(nb, (char *)mb.name, sizeof(nb));
         if (sfu_ret <= 0) {
@@ -641,14 +607,12 @@ static long wanbai_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
             return -14;
         }
         nb[255] = '\0';
-        printk(KERN_INFO "wanbai: module name='%s'\n", nb);
         mb.base = module_base(mb.pid, nb);
         long ctu_ret = kp_copy_to_user((void *)arg, &mb, sizeof(mb));
         if (ctu_ret) {
             printk(KERN_ERR "wanbai: OP_MODULE_BASE copy_to_user failed: %ld\n", ctu_ret);
             return -14;
         }
-        printk(KERN_INFO "wanbai: OP_MODULE_BASE result base=0x%llx\n", mb.base);
         return 0;
     }
     default:
@@ -703,12 +667,6 @@ static long wanbai_init(const char *args, const char *event, void *__user rsv)
     kp_probe_kernel_read = (t_probe_kernel_read)kallsyms_lookup_name("probe_kernel_read");
     kp_copy_from_kernel_nofault = (t_copy_from_kernel_nofault)kallsyms_lookup_name("copy_from_kernel_nofault");
 
-    printk(KERN_INFO "wanbai: safe read funcs: probe=%p nofault=%p\n",
-           kp_probe_kernel_read, kp_copy_from_kernel_nofault);
-
-    printk(KERN_INFO "wanbai: read funcs: __kernel_read=%p kernel_read=%p vfs_read=%p\n",
-           kp___kernel_read, kp_kernel_read, kp_vfs_read);
-
     /* copy_from_user depends on arm64 kernel version */
     kp_copy_from_user = (t_copy_from_user)kallsyms_lookup_name("_copy_from_user");
     if (!kp_copy_from_user) kp_copy_from_user = (t_copy_from_user)kallsyms_lookup_name("__arch_copy_from_user");
@@ -743,7 +701,7 @@ static long wanbai_init(const char *args, const char *event, void *__user rsv)
      * in the struct to determine the 'open' offset, then derive ioctl:
      *
      *   open at 0x60 → ioctl = 0x48  (4.9-4.19, no mmap_supported_flags)
-     *   open at 0x68 → ioctl = 0x48  (4.20-5.0  or  5.9-6.12)
+     *   open at 0x68/0x70 → ioctl = 0x48  (4.20-5.0  or  5.9-6.12)
      *   open at 0x70 → ioctl = 0x50  (5.1-5.8)
      * ------------------------------------------------------------------ */
     {
@@ -796,8 +754,6 @@ static long wanbai_init(const char *args, const char *event, void *__user rsv)
             fops_ioctl_offset = (open_off <= 0x60)
                                 ? open_off - 0x18
                                 : open_off - 0x20;
-            printk(KERN_INFO "wanbai: probed open=0x%x → ioctl=0x%x\n",
-                   open_off, fops_ioctl_offset);
         } else {
             fops_ioctl_offset = 0x48; /* safe fallback for 4.14 */
             printk(KERN_WARNING "wanbai: fops probe failed, defaulting ioctl=0x48\n");
@@ -838,8 +794,6 @@ static long wanbai_init(const char *args, const char *event, void *__user rsv)
         kp_kfree(p_wanbai_dev);
         p_wanbai_fops = 0;
         p_wanbai_dev = 0;
-    } else {
-        printk(KERN_INFO "wanbai: /dev/wanbai ready\n");
     }
     return ret;
 }
@@ -852,7 +806,6 @@ static long wanbai_exit(void *__user rsv)
     if (p_wanbai_dev)  { kp_kfree(p_wanbai_dev);  p_wanbai_dev = 0; }
     if (p_wanbai_fops) { kp_kfree(p_wanbai_fops); p_wanbai_fops = 0; }
 
-    printk(KERN_INFO "wanbai: unloaded\n");
     return 0;
 }
 
