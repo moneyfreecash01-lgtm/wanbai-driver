@@ -6,6 +6,10 @@ This guide provides instructions on how to properly retrieve kernel logs and deb
 
 To get real-time kernel logs while your module is loading or running:
 
+// for all see mapping functions
+cat /proc/kallsyms | grep " vmap"
+
+
 1. Open a terminal or ADB shell on your device.
 2. Gain root access:
    ```bash

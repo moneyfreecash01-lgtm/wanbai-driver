@@ -653,10 +653,22 @@ static long wanbai_init(const char *args, const char *event, void *__user rsv)
     RESOLVE(kp_access_process_vm, "access_process_vm");
     RESOLVE(kp_misc_register,   "misc_register");
     RESOLVE(kp_misc_deregister, "misc_deregister");
-    RESOLVE(kp_kmalloc,         "__kmalloc");
+    /* __kmalloc was renamed to __kmalloc_noprof in kernel 6.10+ (alloc_tag profiling) */
+    kp_kmalloc = (t_kmalloc)kallsyms_lookup_name("__kmalloc");
+    if (!kp_kmalloc) kp_kmalloc = (t_kmalloc)kallsyms_lookup_name("__kmalloc_noprof");
+    if (!kp_kmalloc) { printk(KERN_ERR "wanbai: missing: __kmalloc / __kmalloc_noprof\n"); missing++; }
+
     RESOLVE(kp_kfree,           "kfree");
-    RESOLVE(kp_get_zeroed_page, "get_zeroed_page");
-    RESOLVE(kp_free_pages,      "free_pages");
+
+    /* get_zeroed_page was renamed to get_zeroed_page_noprof in kernel 6.10+ */
+    kp_get_zeroed_page = (t_get_zeroed_page)kallsyms_lookup_name("get_zeroed_page");
+    if (!kp_get_zeroed_page) kp_get_zeroed_page = (t_get_zeroed_page)kallsyms_lookup_name("get_zeroed_page_noprof");
+    if (!kp_get_zeroed_page) { printk(KERN_ERR "wanbai: missing: get_zeroed_page / get_zeroed_page_noprof\n"); missing++; }
+
+    /* free_pages was renamed to free_pages_noprof in kernel 6.10+ */
+    kp_free_pages = (t_free_pages)kallsyms_lookup_name("free_pages");
+    if (!kp_free_pages) kp_free_pages = (t_free_pages)kallsyms_lookup_name("free_pages_noprof");
+    if (!kp_free_pages) { printk(KERN_ERR "wanbai: missing: free_pages / free_pages_noprof\n"); missing++; }
 
     kp_snprintf = (t_snprintf)kallsyms_lookup_name("snprintf");
     kp_filp_open = (t_filp_open)kallsyms_lookup_name("filp_open");
