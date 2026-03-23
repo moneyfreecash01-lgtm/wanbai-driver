@@ -19,10 +19,10 @@
 #include <linux/printk.h>
 
 KPM_NAME("universal-ioctl-driver");
-KPM_VERSION("2.0.6");
+KPM_VERSION("2.0.7");
 KPM_LICENSE("ALL RIGHTS RESERVED BY ALEX5402");
 KPM_AUTHOR("@alex5402");
-KPM_DESCRIPTION("Universal ioctl driver supports Gt driver, dit-driver, dit pro driver,  wanbai driver, LDG kpm driver, for 4.9 to 6.12 (/dev/wanbai) for support visit t.me/alex5402");
+KPM_DESCRIPTION("Universal ioctl driver supports Gt driver, dit-driver, dit pro driver,  wanbai driver, LDG kpm driver, for 4.4 to all latest kernels (/dev/wanbai) for support visit t.me/alex5402");
 
 #define OP_INIT_KEY     0x800
 #define OP_READ_MEM     0x801
@@ -162,9 +162,17 @@ static t_filp_close kp_filp_close;
 /* -----------------------------------------------------------------------
  * iovec for process_vm_rw
  * --------------------------------------------------------------------- */
-/* FOLL_FORCE for access_process_vm (bypass VMA permissions) */
-#define FOLL_FORCE  0x10
-#define FOLL_WRITE  0x01
+/* FOLL_FORCE value changed across kernel versions:
+ *   Kernels <= 6.2:  FOLL_FORCE = 0x10 (BIT(4)), FOLL_TOUCH was at BIT(1)
+ *   Kernels >= 6.3:  FOLL_FORCE = 0x08 (BIT(3)), FOLL_TOUCH removed, flags shifted
+ *
+ * Using the wrong value is catastrophic: 0x10 on 6.3+ maps to FOLL_NOWAIT
+ * which causes access_process_vm to return 0 for pages needing fault-in.
+ */
+#define FOLL_FORCE_OLD  0x10  /* kernels <= 6.2 */
+#define FOLL_FORCE_NEW  0x08  /* kernels >= 6.3 */
+#define FOLL_WRITE      0x01
+static unsigned int kp_foll_force = FOLL_FORCE_OLD;  /* detected at init */
 
 /* -----------------------------------------------------------------------
  * VMA walk offsets (arm64)
@@ -287,12 +295,16 @@ static long xmem(int32_t pid, uint64_t addr, void *buf, uint64_t sz, int wr)
         printk(KERN_ERR "wanbai: xmem: get_pid_task(%d) returned NULL\n", pid);
         return -3;
     }
-    unsigned int flags = FOLL_FORCE | (wr ? FOLL_WRITE : 0);
+    /* Do NOT pass FOLL_FORCE — its value changed between kernel versions:
+     *   <= 6.2: 0x10,  >= 6.3: 0x08
+     * Passing the wrong value sets FOLL_NOWAIT causing 0-byte returns.
+     * For reading/writing normal process memory, FOLL_FORCE is not needed. */
+    unsigned int flags = wr ? FOLL_WRITE : 0;
     int done = kp_access_process_vm(t, (unsigned long)addr, buf, (int)sz, flags);
     safe_put_task(t);
     if (done != (int)sz) {
-        printk(KERN_ERR "wanbai: xmem: access_process_vm FAILED: requested=%llu got=%d (pid=%d addr=%llx wr=%d)\n",
-               sz, done, pid, addr, wr);
+        printk(KERN_ERR "wanbai: xmem: access_process_vm FAILED: requested=%llu got=%d (pid=%d addr=%llx wr=%d flags=0x%x)\n",
+               sz, done, pid, addr, wr, flags);
         return -5;
     }
     return 0;
@@ -704,6 +716,32 @@ static long wanbai_init(const char *args, const char *event, void *__user rsv)
     }
 
     printk(KERN_INFO "wanbai: symbols OK\n");
+
+    /* ------------------------------------------------------------------
+     * Detect correct FOLL_FORCE value.
+     *
+     * In kernel 6.3, FOLL_TOUCH (0x02) was removed and the GUP flags
+     * were renumbered:
+     *   <= 6.2:  WRITE=0x01  TOUCH=0x02  GET=0x04  DUMP=0x08  FORCE=0x10
+     *   >= 6.3:  WRITE=0x01            GET=0x02  DUMP=0x04  FORCE=0x08
+     *
+     * Passing old 0x10 on 6.3+ actually sets FOLL_NOWAIT, causing
+     * access_process_vm to return 0 for any page needing fault-in.
+     *
+     * Detection: __kmalloc_noprof implies 6.10+ (definitely FORCE=0x08).
+     * For 6.3-6.9, we probe for folio_alloc_noprof (introduced in 6.3).
+     * If neither, assume old kernel with FORCE=0x10.
+     * ------------------------------------------------------------------ */
+    if (kallsyms_lookup_name("__kmalloc_noprof") ||
+        kallsyms_lookup_name("folio_alloc_noprof")) {
+        kp_foll_force = FOLL_FORCE_NEW;  /* 0x08, kernel >= 6.3 */
+        printk(KERN_INFO "wanbai: detected kernel >= 6.3, FOLL_FORCE=0x%x\n",
+               kp_foll_force);
+    } else {
+        kp_foll_force = FOLL_FORCE_OLD;  /* 0x10, kernel <= 6.2 */
+        printk(KERN_INFO "wanbai: detected kernel <= 6.2, FOLL_FORCE=0x%x\n",
+               kp_foll_force);
+    }
 
     /* ------------------------------------------------------------------
      * Probe the unlocked_ioctl offset in file_operations.
