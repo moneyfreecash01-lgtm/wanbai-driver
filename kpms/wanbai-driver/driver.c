@@ -19,7 +19,7 @@
 #include <linux/printk.h>
 
 KPM_NAME("universal-ioctl-driver");
-KPM_VERSION("2.0.7");
+KPM_VERSION("2.0.9");
 KPM_LICENSE("ALL RIGHTS RESERVED BY ALEX5402");
 KPM_AUTHOR("@alex5402");
 KPM_DESCRIPTION("Universal ioctl driver supports Gt driver, dit-driver, dit pro driver,  wanbai driver, LDG kpm driver, for 4.4 to all latest kernels (/dev/wanbai) for support visit t.me/alex5402");
@@ -132,10 +132,44 @@ static t_kmalloc          kp_kmalloc;
 static t_kfree            kp_kfree;
 static t_get_zeroed_page  kp_get_zeroed_page;
 static t_free_pages       kp_free_pages;
-static t_copy_from_user   kp_copy_from_user;
-static t_copy_from_user   kp_copy_to_user; /* Signature is identical */
+static t_copy_from_user   kp_raw_copy_from_user;  /* Resolved function pointer */
+static t_copy_from_user   kp_raw_copy_to_user;    /* Resolved function pointer */
+static int                kp_using_arch_copy = 0; /* 1 if using __arch_copy (needs PAN toggle) */
 typedef long (*t_strncpy_from_user)(char *, const char *, long);
 static t_strncpy_from_user kp_strncpy_from_user;
+
+/* PAN-safe copy wrappers.
+ * __arch_copy_from_user uses LDTR on some kernels but NOT all (KASAN/CFI builds
+ * may instrument it differently). To be safe, we disable PAN before calling
+ * __arch_copy and re-enable after. For _copy_from_user, PAN is already handled. */
+static inline long kp_copy_from_user(void *to, const void *from, uint64_t n)
+{
+    long ret;
+    if (kp_using_arch_copy) {
+        /* Disable PAN: set PSTATE.PAN = 0
+         * 0xd500409f = MSR PAN, #0  (encoded directly for assembler compat) */
+        asm volatile(".inst 0xd500409f" ::: "memory");
+        ret = kp_raw_copy_from_user(to, from, n);
+        /* Re-enable PAN: 0xd500419f = MSR PAN, #1 */
+        asm volatile(".inst 0xd500419f" ::: "memory");
+    } else {
+        ret = kp_raw_copy_from_user(to, from, n);
+    }
+    return ret;
+}
+
+static inline long kp_copy_to_user(void *to, const void *from, uint64_t n)
+{
+    long ret;
+    if (kp_using_arch_copy) {
+        asm volatile(".inst 0xd500409f" ::: "memory"); /* MSR PAN, #0 */
+        ret = kp_raw_copy_to_user(to, from, n);
+        asm volatile(".inst 0xd500419f" ::: "memory"); /* MSR PAN, #1 */
+    } else {
+        ret = kp_raw_copy_to_user(to, from, n);
+    }
+    return ret;
+}
 
 typedef int (*t_snprintf)(char *buf, size_t size, const char *fmt, ...);
 static t_snprintf kp_snprintf;
@@ -186,7 +220,13 @@ static unsigned int kp_foll_force = FOLL_FORCE_OLD;  /* detected at init */
  *   vm_mm              = probed at runtime (typically 0x40)
  *   vm_file            = vm_mm + 0x60 (fixed distance on arm64 4.x-5.x)
  * --------------------------------------------------------------------- */
-#define MM_MMAP_OFFSET      0x0
+/* mm_struct.mmap offset — probed at runtime since it varies:
+ *   Custom GKI1 5.10:  mmap is at 0x0 (first field)
+ *   Stock GKI2 5.10:   mmap is elsewhere (CONFIG_SPECULATIVE_PAGE_FAULT shifts it)
+ *   6.1+:              uses maple tree (mm_mt), layout differs again
+ */
+static int mm_mmap_offset = -1;    /* probed once at first use */
+static int vma_vm_next_off = 0x10; /* vm_next offset, verified at probe time */
 
 /* Safe memory read helper to prevent panics when reading unpinned memory */
 static inline int kp_safe_read(void *dst, const void *src, size_t size)
@@ -200,6 +240,47 @@ static inline int kp_safe_read(void *dst, const void *src, size_t size)
 
 /* Cached vm_file offset, probed once at first use */
 static int vma_vm_file_off = 0;
+
+/* Probe mm_struct.mmap offset by scanning for a VMA pointer.
+ * A valid VMA has vm_start in userspace range and vm_end > vm_start.
+ * We also verify the candidate VMA has a vm_mm back-pointer == mm. */
+static int probe_mm_mmap_offset(struct mm_struct *mm)
+{
+    uint64_t mm_val = (uint64_t)mm;
+    /* Scan mm_struct for the first VMA pointer */
+    for (int off = 0; off <= 0x200; off += 8) {
+        uint64_t candidate = 0;
+        if (kp_safe_read(&candidate, (char *)mm + off, sizeof(candidate)))
+            continue;
+        if (!candidate || candidate < 0xffff000000000000ULL)
+            continue;  /* must be a kernel pointer (arm64 kernel space) */
+        /* Verify: read vm_start (offset 0) — should be a userspace addr */
+        uint64_t vm_start = 0;
+        if (kp_safe_read(&vm_start, (void *)candidate, sizeof(vm_start)))
+            continue;
+        if (vm_start == 0 || vm_start >= 0xffff000000000000ULL)
+            continue;  /* vm_start must be userspace */
+        /* Verify: read vm_end (offset 8) — should be > vm_start */
+        uint64_t vm_end = 0;
+        if (kp_safe_read(&vm_end, (void *)(candidate + 8), sizeof(vm_end)))
+            continue;
+        if (vm_end <= vm_start)
+            continue;
+        /* Verify: find vm_mm back-pointer in this VMA */
+        for (int vmm_off = 0x20; vmm_off <= 0x80; vmm_off += 8) {
+            uint64_t vmm = 0;
+            if (kp_safe_read(&vmm, (void *)(candidate + vmm_off), sizeof(vmm)))
+                continue;
+            if (vmm == mm_val) {
+                printk(KERN_INFO "wanbai: probed mm->mmap offset=0x%x (vma=%llx vm_start=%llx)\n",
+                       off, candidate, vm_start);
+                return off;
+            }
+        }
+    }
+    printk(KERN_ERR "wanbai: failed to probe mm->mmap offset, trying default 0x0\n");
+    return 0;  /* fallback */
+}
 
 /* Probe vm_file offset by finding vm_mm back-pointer in the first VMA.
  * Every VMA has vma->vm_mm == mm.  We scan the VMA struct for a word
@@ -223,6 +304,42 @@ static int probe_vm_file_offset(struct vm_area_struct *vma, struct mm_struct *mm
     }
     /* Fallback: try common offsets */
     return 0xa0;
+}
+
+/* Probe vm_next offset by checking candidate next pointers in a VMA.
+ * vm_next is typically at 0x10 but can vary. The next VMA should also
+ * have vm_mm == mm. */
+static int probe_vm_next_offset(struct vm_area_struct *vma, struct mm_struct *mm)
+{
+    uint64_t mm_val = (uint64_t)mm;
+    /* Try common offsets: 0x08, 0x10, 0x18 */
+    int candidates[] = { 0x10, 0x08, 0x18 };
+    for (int i = 0; i < 3; i++) {
+        int off = candidates[i];
+        uint64_t next = 0;
+        if (kp_safe_read(&next, (char *)vma + off, sizeof(next)))
+            continue;
+        if (!next) continue;  /* end of list is OK for offset 0x10 */
+        if (next < 0xffff000000000000ULL) continue;  /* must be kernel ptr */
+        /* Verify next VMA has valid vm_start */
+        uint64_t ns = 0;
+        if (kp_safe_read(&ns, (void *)next, sizeof(ns)))
+            continue;
+        if (ns == 0 || ns >= 0xffff000000000000ULL)
+            continue;
+        /* Verify next VMA's vm_mm matches */
+        for (int vmm_off = 0x20; vmm_off <= 0x80; vmm_off += 8) {
+            uint64_t vmm = 0;
+            if (kp_safe_read(&vmm, (void *)(next + vmm_off), sizeof(vmm)))
+                continue;
+            if (vmm == mm_val) {
+                printk(KERN_INFO "wanbai: probed vm_next offset=0x%x\n", off);
+                return off;
+            }
+        }
+    }
+    printk(KERN_INFO "wanbai: vm_next probe failed, using default 0x10\n");
+    return 0x10;  /* default */
 }
 
 /* Inline char helpers (bare-metal gcc emits libcall otherwise) */
@@ -285,16 +402,10 @@ static void safe_put_task(struct task_struct *t)
 static long xmem(int32_t pid, uint64_t addr, void *buf, uint64_t sz, int wr)
 {
     struct pid *p = kp_find_get_pid(pid);
-    if (!p) {
-        printk(KERN_ERR "wanbai: xmem: find_get_pid(%d) returned NULL\n", pid);
-        return -3;
-    }
+    if (!p) return -3;
     struct task_struct *t = kp_get_pid_task(p, PIDTYPE_PID);
     kp_put_pid(p);
-    if (!t) {
-        printk(KERN_ERR "wanbai: xmem: get_pid_task(%d) returned NULL\n", pid);
-        return -3;
-    }
+    if (!t) return -3;
     /* Do NOT pass FOLL_FORCE — its value changed between kernel versions:
      *   <= 6.2: 0x10,  >= 6.3: 0x08
      * Passing the wrong value sets FOLL_NOWAIT causing 0-byte returns.
@@ -302,11 +413,7 @@ static long xmem(int32_t pid, uint64_t addr, void *buf, uint64_t sz, int wr)
     unsigned int flags = wr ? FOLL_WRITE : 0;
     int done = kp_access_process_vm(t, (unsigned long)addr, buf, (int)sz, flags);
     safe_put_task(t);
-    if (done != (int)sz) {
-        printk(KERN_ERR "wanbai: xmem: access_process_vm FAILED: requested=%llu got=%d (pid=%d addr=%llx wr=%d flags=0x%x)\n",
-               sz, done, pid, addr, wr, flags);
-        return -5;
-    }
+    if (done != (int)sz) return -5;
     return 0;
 }
 
@@ -395,16 +502,25 @@ static uint64_t module_base_vma(int32_t pid, const char *name)
         return 0;
     }
 
-    /* Safely read mm->mmap (first field of mm_struct) */
+    /* Probe mm->mmap offset on first call */
+    if (mm_mmap_offset < 0) {
+        mm_mmap_offset = probe_mm_mmap_offset(mm);
+    }
+
+    /* Safely read mm->mmap */
     struct vm_area_struct *vma = NULL;
-    if (kp_safe_read(&vma, (char *)mm + MM_MMAP_OFFSET, sizeof(vma)) || !vma) {
+    if (kp_safe_read(&vma, (char *)mm + mm_mmap_offset, sizeof(vma)) || !vma) {
+        printk(KERN_ERR "wanbai: mm->mmap read failed at offset 0x%x\n", mm_mmap_offset);
         kp_mmput(mm);
         return 0;
     }
 
-    /* Probe vm_file offset on first call */
+    /* Probe vm_file and vm_next offsets on first call */
     if (!vma_vm_file_off) {
         vma_vm_file_off = probe_vm_file_offset(vma, mm);
+        vma_vm_next_off = probe_vm_next_offset(vma, mm);
+        printk(KERN_INFO "wanbai: VMA offsets: mm_mmap=0x%x vm_file=0x%x vm_next=0x%x\n",
+               mm_mmap_offset, vma_vm_file_off, vma_vm_next_off);
     }
 
     int count = 0;
@@ -432,9 +548,9 @@ static uint64_t module_base_vma(int32_t pid, const char *name)
                 break;
             }
         }
-        /* Read next VMA pointer (vm_next at offset 0x10) */
+        /* Read next VMA pointer at probed vm_next offset */
         void *next = NULL;
-        if (kp_safe_read(&next, (char *)vma + 0x10, sizeof(next)))
+        if (kp_safe_read(&next, (char *)vma + vma_vm_next_off, sizeof(next)))
             break;
         vma = (struct vm_area_struct *)next;
     }
@@ -545,29 +661,16 @@ static long wanbai_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     case OP_READ_MEM: {
         COPY_MEMORY cm;
         long cfu = kp_copy_from_user(&cm, (void *)arg, sizeof(cm));
-        if (cfu) {
-            printk(KERN_ERR "wanbai: OP_READ_MEM copy_from_user(COPY_MEMORY) failed: %ld\n", cfu);
-            return -14;
-        }
-        if (!cm.size || cm.size > 0x1000000ULL) {
-            printk(KERN_ERR "wanbai: OP_READ_MEM invalid size=%llu\n", cm.size);
-            return -22;
-        }
+        if (cfu) return -14;
+        if (!cm.size || cm.size > 0x1000000ULL) return -22;
         void *tmp = kp_kmalloc(cm.size, GFP_KERNEL);
-        if (!tmp) {
-            printk(KERN_ERR "wanbai: OP_READ_MEM kmalloc(%llu) FAILED (OOM)\n", cm.size);
-            return -12;
-        }
+        if (!tmp) return -12;
         long r = xmem(cm.pid, cm.addr, tmp, cm.size, 0);
         if (r) {
-            printk(KERN_ERR "wanbai: OP_READ_MEM xmem read FAILED: %ld (pid=%d addr=0x%llx size=%llu)\n",
-                   r, cm.pid, cm.addr, cm.size);
             kp_kfree(tmp);
             return r;
         }
         if (kp_copy_to_user((void *)cm.buffer, tmp, cm.size)) {
-            printk(KERN_ERR "wanbai: OP_READ_MEM copy_to_user FAILED (buf=0x%llx size=%llu)\n",
-                   cm.buffer, cm.size);
             kp_kfree(tmp);
             return -14;
         }
@@ -577,58 +680,48 @@ static long wanbai_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     case OP_WRITE_MEM: {
         COPY_MEMORY cm;
         long cfu = kp_copy_from_user(&cm, (void *)arg, sizeof(cm));
-        if (cfu) {
-            printk(KERN_ERR "wanbai: OP_WRITE_MEM copy_from_user(COPY_MEMORY) failed: %ld\n", cfu);
-            return -14;
-        }
-        if (!cm.size || cm.size > 0x1000000ULL) {
-            printk(KERN_ERR "wanbai: OP_WRITE_MEM invalid size=%llu\n", cm.size);
-            return -22;
-        }
+        if (cfu) return -14;
+        if (!cm.size || cm.size > 0x1000000ULL) return -22;
         void *tmp = kp_kmalloc(cm.size, GFP_KERNEL);
-        if (!tmp) {
-            printk(KERN_ERR "wanbai: OP_WRITE_MEM kmalloc(%llu) FAILED (OOM)\n", cm.size);
-            return -12;
-        }
+        if (!tmp) return -12;
         long cfu2 = kp_copy_from_user(tmp, (void *)cm.buffer, cm.size);
         if (cfu2) {
-            printk(KERN_ERR "wanbai: OP_WRITE_MEM copy_from_user(data) FAILED: %ld (buf=0x%llx size=%llu)\n",
-                   cfu2, cm.buffer, cm.size);
             kp_kfree(tmp);
             return -14;
         }
         long r = xmem(cm.pid, cm.addr, tmp, cm.size, 1);
-        if (r) {
-            printk(KERN_ERR "wanbai: OP_WRITE_MEM xmem write FAILED: %ld (pid=%d addr=0x%llx size=%llu)\n",
-                   r, cm.pid, cm.addr, cm.size);
-        }
+
         kp_kfree(tmp);
         return r;
     }
     case OP_MODULE_BASE: {
-        MODULE_BASE mb;
+        MODULE_BASE mb = {0, 0, 0, 0};
         long cfu_ret = kp_copy_from_user(&mb, (void *)arg, sizeof(mb));
-        if (cfu_ret) {
-            printk(KERN_ERR "wanbai: OP_MODULE_BASE copy_from_user failed: %ld\n", cfu_ret);
-            return -14;
-        }
+        if (cfu_ret) return -14;
         char nb[256];
-        long sfu_ret = kp_strncpy_from_user(nb, (char *)mb.name, sizeof(nb));
-        if (sfu_ret <= 0) {
-            printk(KERN_ERR "wanbai: OP_MODULE_BASE strncpy_from_user failed: %ld\n", sfu_ret);
-            return -14;
+        /* Try copy_from_user first (works on hardened GKI2 stock kernels
+         * where strncpy_from_user fails with -EFAULT in hooked ioctl context).
+         * Fall back to strncpy_from_user if copy_from_user fails. */
+        long sfu_ret = -1;
+        if (mb.name) {
+            long cfu2 = kp_copy_from_user(nb, (char *)(uintptr_t)mb.name, sizeof(nb) - 1);
+            if (cfu2 == 0) {
+                nb[sizeof(nb) - 1] = '\0';
+                /* Ensure null termination within the buffer */
+                sfu_ret = kpm_strlen(nb);
+            } else {
+                /* Fallback to strncpy_from_user */
+                sfu_ret = kp_strncpy_from_user(nb, (char *)(uintptr_t)mb.name, sizeof(nb));
+            }
         }
+        if (sfu_ret <= 0) return -14;
         nb[255] = '\0';
         mb.base = module_base(mb.pid, nb);
         long ctu_ret = kp_copy_to_user((void *)arg, &mb, sizeof(mb));
-        if (ctu_ret) {
-            printk(KERN_ERR "wanbai: OP_MODULE_BASE copy_to_user failed: %ld\n", ctu_ret);
-            return -14;
-        }
+        if (ctu_ret) return -14;
         return 0;
     }
     default:
-        printk(KERN_WARNING "wanbai: unknown cmd=0x%x\n", cmd);
         return -25;
     }
 }
@@ -691,16 +784,26 @@ static long wanbai_init(const char *args, const char *event, void *__user rsv)
     kp_probe_kernel_read = (t_probe_kernel_read)kallsyms_lookup_name("probe_kernel_read");
     kp_copy_from_kernel_nofault = (t_copy_from_kernel_nofault)kallsyms_lookup_name("copy_from_kernel_nofault");
 
-    /* copy_from_user depends on arm64 kernel version */
-    kp_copy_from_user = (t_copy_from_user)kallsyms_lookup_name("_copy_from_user");
-    if (!kp_copy_from_user) kp_copy_from_user = (t_copy_from_user)kallsyms_lookup_name("__arch_copy_from_user");
+    /* copy_from_user: prefer __arch_copy_from_user (raw LDTR copier).
+     * On GKI2 stock 5.10, _copy_from_user is broken (copies only first
+     * few bytes but returns 0). __arch_copy uses LDTR which bypasses PAN. */
+    kp_raw_copy_from_user = (t_copy_from_user)kallsyms_lookup_name("__arch_copy_from_user");
+    if (kp_raw_copy_from_user) {
+        printk(KERN_INFO "wanbai: using __arch_copy_from_user\n");
+    } else {
+        kp_raw_copy_from_user = (t_copy_from_user)kallsyms_lookup_name("_copy_from_user");
+        if (kp_raw_copy_from_user)
+            printk(KERN_INFO "wanbai: using _copy_from_user (fallback)\n");
+    }
 
-    kp_copy_to_user = (t_copy_from_user)kallsyms_lookup_name("_copy_to_user");
-    if (!kp_copy_to_user) kp_copy_to_user = (t_copy_from_user)kallsyms_lookup_name("__arch_copy_to_user");
+    kp_raw_copy_to_user = (t_copy_from_user)kallsyms_lookup_name("__arch_copy_to_user");
+    if (!kp_raw_copy_to_user) {
+        kp_raw_copy_to_user = (t_copy_from_user)kallsyms_lookup_name("_copy_to_user");
+    }
 
     kp_strncpy_from_user = (t_strncpy_from_user)kallsyms_lookup_name("strncpy_from_user");
 
-    if (!kp_copy_from_user || !kp_copy_to_user) {
+    if (!kp_raw_copy_from_user || !kp_raw_copy_to_user) {
         printk(KERN_ERR "wanbai: missing: [__arch]_copy_from_user\n");
         missing++;
     }
@@ -827,9 +930,25 @@ static long wanbai_init(const char *args, const char *event, void *__user rsv)
     char *p2 = (char *)p_wanbai_dev;
     for (int i = 0; i < 4096; i++) { p1[i] = 0; p2[i] = 0; }
 
-    /* Write ioctl function pointers at the probed offsets */
-    *(uint64_t *)(p1 + fops_ioctl_offset)  = (uint64_t)wanbai_ioctl;
-    *(uint64_t *)(p1 + fops_compat_offset) = (uint64_t)wanbai_ioctl;
+    /* Write ioctl function pointers at ALL possible offsets.
+     * On different kernels, unlocked_ioctl can be at 0x38..0x58.
+     * compat_ioctl is always unlocked_ioctl + 0x08.
+     * Writing to multiple offsets is safe because unused slots (like poll,
+     * iterate_shared) being set to wanbai_ioctl just means those syscalls
+     * call our handler which returns -EINVAL for unknown cmds.
+     * Known layouts (arm64):
+     *   4.9-4.14:  ioctl=0x38 (no iopoll, iterate_shared before 4.7 varies)
+     *   4.19-5.0:  ioctl=0x48 (has iopoll but no iterate, or iterate at 0x38)
+     *   5.1-5.8:   ioctl=0x50 (iterate + iterate_shared added)
+     *   5.10-6.x:  ioctl=0x48 or 0x50 (depends on CONFIG_ITERATE_DIR etc.) */
+    int ioctl_offsets[] = { 0x38, 0x40, 0x48, 0x50, 0x58 };
+    int n_offsets = sizeof(ioctl_offsets) / sizeof(ioctl_offsets[0]);
+    for (int i = 0; i < n_offsets; i++) {
+        int off = ioctl_offsets[i];
+        *(uint64_t *)(p1 + off) = (uint64_t)wanbai_ioctl;
+    }
+    printk(KERN_INFO "wanbai: ioctl handler installed at offsets 0x38-0x58 (probed=0x%x)\n",
+           fops_ioctl_offset);
 
     /* Set up miscdevice */
     p_wanbai_dev->minor = MISC_DYNAMIC_MINOR;
