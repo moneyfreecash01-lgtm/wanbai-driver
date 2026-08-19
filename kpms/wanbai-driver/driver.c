@@ -19,7 +19,7 @@
 #include <linux/printk.h>
 
 KPM_NAME("universal-ioctl-driver");
-KPM_VERSION("2.0.9");
+KPM_VERSION("3.0.2");
 KPM_LICENSE("ALL RIGHTS RESERVED BY ALEX5402");
 KPM_AUTHOR("@alex5402");
 KPM_DESCRIPTION("Universal ioctl driver supports Gt driver, dit-driver, dit pro driver,  wanbai driver, LDG kpm driver, for 4.4 to all latest kernels (/dev/wanbai) for support visit t.me/alex5402");
@@ -28,6 +28,23 @@ KPM_DESCRIPTION("Universal ioctl driver supports Gt driver, dit-driver, dit pro 
 #define OP_READ_MEM     0x801
 #define OP_WRITE_MEM    0x802
 #define OP_MODULE_BASE  0x803
+#define OP_GET_PID      0x804
+#define OP_TOUCH_INIT   0x805
+#define OP_TOUCH_EVENT  0x806
+#define OP_CALLFUNC_1   0x900 /* Matches wanbai.h tscape_input(__CALLFUNC_1) */
+
+/* Linux input event types and codes */
+#define KPM_EV_SYN              0x00
+#define KPM_EV_KEY              0x01
+#define KPM_EV_REL              0x02
+#define KPM_EV_ABS              0x03
+#define KPM_SYN_REPORT          0
+#define KPM_ABS_MT_SLOT         0x2f
+#define KPM_ABS_MT_TOUCH_MAJOR  0x30
+#define KPM_ABS_MT_POSITION_X   0x35
+#define KPM_ABS_MT_POSITION_Y   0x36
+#define KPM_ABS_MT_TRACKING_ID  0x39
+#define KPM_BTN_TOUCH           0x14a
 
 /* Matches userspace COPY_MEMORY: pid_t(4) + pad(4) + uintptr_t(8) + void*(8) + size_t(8) */
 typedef struct {
@@ -45,6 +62,20 @@ typedef struct {
     uint64_t  name;   /* userspace char* pointer */
     uint64_t  base;
 } MODULE_BASE;
+
+/* Matches userspace GET_PID */
+typedef struct {
+    char      name[256];
+    int32_t   pid;
+} GET_PID;
+
+/* Matches userspace TOUCH_EVENT */
+typedef struct {
+    int32_t   type;   /* EV_ABS, EV_SYN, EV_KEY */
+    int32_t   code;   /* ABS_MT_POSITION_X, ABS_MT_POSITION_Y, etc. */
+    int32_t   value;  /* Coordinate, tracking ID, or press state */
+    int32_t   _pad;
+} TOUCH_EVENT;
 
 
 /* Opaque types */
@@ -100,6 +131,7 @@ struct kpm_miscdevice {
  * --------------------------------------------------------------------- */
 typedef struct pid           *(*t_find_get_pid)(int32_t);
 typedef struct task_struct   *(*t_get_pid_task)(struct pid *, int);
+typedef struct task_struct   *(*t_pid_task)(struct pid *, int);
 typedef void                  (*t_put_pid)(struct pid *);
 typedef void                  (*t_put_task_struct)(struct task_struct *);
 typedef struct mm_struct     *(*t_get_task_mm)(struct task_struct *);
@@ -108,6 +140,11 @@ typedef int                   (*t_access_process_vm)(struct task_struct *,
                                                       unsigned long addr,
                                                       void *buf, int len,
                                                       unsigned int gup_flags);
+typedef int                   (*t_access_remote_vm)(struct mm_struct *,
+                                                     unsigned long addr,
+                                                     void *buf, int len,
+                                                     unsigned int gup_flags);
+typedef void                  (*t_rcu_lock)(void);
 typedef int                   (*t_misc_register)(struct kpm_miscdevice *);
 typedef void                  (*t_misc_deregister)(struct kpm_miscdevice *);
 typedef void                 *(*t_kmalloc)(uint64_t, uint32_t);
@@ -121,11 +158,15 @@ typedef long                  (*t_copy_from_user)(void *, const void *, uint64_t
 
 static t_find_get_pid     kp_find_get_pid;
 static t_get_pid_task     kp_get_pid_task;
+static t_pid_task         kp_pid_task;
 static t_put_pid          kp_put_pid;
 static t_put_task_struct  kp_put_task_struct;
 static t_get_task_mm      kp_get_task_mm;
 static t_mmput            kp_mmput;
 static t_access_process_vm kp_access_process_vm;
+static t_access_remote_vm  kp_access_remote_vm;
+static t_rcu_lock         kp_rcu_read_lock_fn;
+static t_rcu_lock         kp_rcu_read_unlock_fn;
 static t_misc_register    kp_misc_register;
 static t_misc_deregister  kp_misc_deregister;
 static t_kmalloc          kp_kmalloc;
@@ -137,6 +178,28 @@ static t_copy_from_user   kp_raw_copy_to_user;    /* Resolved function pointer *
 static int                kp_using_arch_copy = 0; /* 1 if using __arch_copy (needs PAN toggle) */
 typedef long (*t_strncpy_from_user)(char *, const char *, long);
 static t_strncpy_from_user kp_strncpy_from_user;
+
+struct input_dev;
+typedef void (*t_input_event)(struct input_dev *, unsigned int, unsigned int, int);
+static t_input_event kp_input_event;
+static struct input_dev *p_touch_dev = NULL;
+
+/* RCU read-side critical section helpers */
+static inline void kpm_rcu_read_lock(void)
+{
+    if (kp_rcu_read_lock_fn)
+        kp_rcu_read_lock_fn();
+    else
+        __asm__ __volatile__("" ::: "memory");
+}
+
+static inline void kpm_rcu_read_unlock(void)
+{
+    if (kp_rcu_read_unlock_fn)
+        kp_rcu_read_unlock_fn();
+    else
+        __asm__ __volatile__("" ::: "memory");
+}
 
 /* PAN-safe copy wrappers.
  * __arch_copy_from_user uses LDTR on some kernels but NOT all (KASAN/CFI builds
@@ -380,39 +443,74 @@ static inline long IS_ERR(const void *ptr) {
 }
 
 /* -----------------------------------------------------------------------
- * put_task_struct is inline in 4.14 — the kallsyms __put_task_struct
- * is the *destructor* (frees task), not the refcount decrementer.
+ * Safe task / mm lookup without refcount leaks.
  *
- * We intentionally leak one refcount per xmem call.  This is safe:
- * the target process is alive (we just read/wrote its memory), so
- * the elevated refcount has no effect.  Attempting to probe the
- * usage field offset in task_struct is unreliable and risks silent
- * memory corruption that causes watchdog reboots.
+ * Instead of get_pid_task() (which increments t->usage refcount requiring
+ * an inlined put_task_struct destructor), we use rcu_read_lock() + pid_task()
+ * to borrow the task_struct reference just long enough to acquire mm_struct
+ * via get_task_mm(). get_task_mm() safely increments mm->mm_users, which
+ * is then released with kp_mmput(). This eliminates task refcount leaks.
  * --------------------------------------------------------------------- */
-static void safe_put_task(struct task_struct *t)
+static struct mm_struct *get_mm_by_pid(int32_t pid)
 {
-    (void)t; /* intentional no-op — leak the ref */
+    if (!kp_find_get_pid || !kp_put_pid || !kp_get_task_mm)
+        return NULL;
+
+    struct pid *p = kp_find_get_pid(pid);
+    if (!p)
+        return NULL;
+
+    struct mm_struct *mm = NULL;
+    if (kp_pid_task) {
+        kpm_rcu_read_lock();
+        struct task_struct *t = kp_pid_task(p, PIDTYPE_PID);
+        if (t) {
+            mm = kp_get_task_mm(t);
+        }
+        kpm_rcu_read_unlock();
+    } else if (kp_get_pid_task) {
+        /* Fallback if pid_task symbol is missing */
+        struct task_struct *t = kp_get_pid_task(p, PIDTYPE_PID);
+        if (t) {
+            mm = kp_get_task_mm(t);
+        }
+    }
+    kp_put_pid(p);
+    return mm;
 }
 
 /* -----------------------------------------------------------------------
- * Cross-process memory helper using access_process_vm.
- * Unlike process_vm_rw (which is a syscall backend using copy_from_user
- * on iovec structs), access_process_vm works with kernel buffers directly.
+ * Cross-process memory helper using access_remote_vm / access_process_vm.
+ * Works with kernel buffers directly and uses mm_struct to avoid task leaks.
  * --------------------------------------------------------------------- */
 static long xmem(int32_t pid, uint64_t addr, void *buf, uint64_t sz, int wr)
 {
-    struct pid *p = kp_find_get_pid(pid);
-    if (!p) return -3;
-    struct task_struct *t = kp_get_pid_task(p, PIDTYPE_PID);
-    kp_put_pid(p);
-    if (!t) return -3;
+    struct mm_struct *mm = get_mm_by_pid(pid);
+    if (!mm) return -3;
+
     /* Do NOT pass FOLL_FORCE — its value changed between kernel versions:
      *   <= 6.2: 0x10,  >= 6.3: 0x08
      * Passing the wrong value sets FOLL_NOWAIT causing 0-byte returns.
      * For reading/writing normal process memory, FOLL_FORCE is not needed. */
     unsigned int flags = wr ? FOLL_WRITE : 0;
-    int done = kp_access_process_vm(t, (unsigned long)addr, buf, (int)sz, flags);
-    safe_put_task(t);
+    int done = 0;
+
+    if (kp_access_remote_vm) {
+        done = kp_access_remote_vm(mm, (unsigned long)addr, buf, (int)sz, flags);
+    } else if (kp_access_process_vm) {
+        struct pid *p = kp_find_get_pid(pid);
+        if (p) {
+            kpm_rcu_read_lock();
+            struct task_struct *t = kp_pid_task ? kp_pid_task(p, PIDTYPE_PID) : NULL;
+            kpm_rcu_read_unlock();
+            if (t) {
+                done = kp_access_process_vm(t, (unsigned long)addr, buf, (int)sz, flags);
+            }
+            kp_put_pid(p);
+        }
+    }
+
+    kp_mmput(mm);
     if (done != (int)sz) return -5;
     return 0;
 }
@@ -483,14 +581,7 @@ static int kpm_str_ends_with(const char *str, const char *suffix)
 static uint64_t module_base_vma(int32_t pid, const char *name)
 {
     uint64_t base = 0;
-    struct pid *p = kp_find_get_pid(pid);
-    if (!p) return 0;
-    struct task_struct *t = kp_get_pid_task(p, PIDTYPE_PID);
-    kp_put_pid(p);
-    if (!t) return 0;
-
-    struct mm_struct *mm = kp_get_task_mm(t);
-    safe_put_task(t);
+    struct mm_struct *mm = get_mm_by_pid(pid);
     if (!mm) {
         return 0;
     }
@@ -642,6 +733,194 @@ static uint64_t module_base(int32_t pid, const char *name)
     return base;
 }
 
+/* -----------------------------------------------------------------------
+ * Dynamic task_struct.comm offset probing and PID resolution
+ * --------------------------------------------------------------------- */
+static int task_comm_offset = 0;
+
+static void probe_task_comm_offset(void)
+{
+    char *init_task = (char *)kallsyms_lookup_name("init_task");
+    if (!init_task) return;
+
+    /* Scan init_task for "swapper" string (always present in init_task.comm) */
+    for (int off = 0x100; off < 0x1400; off++) {
+        if (init_task[off] == 's' && init_task[off+1] == 'w' &&
+            init_task[off+2] == 'a' && init_task[off+3] == 'p' &&
+            init_task[off+4] == 'p' && init_task[off+5] == 'e' &&
+            init_task[off+6] == 'r') {
+            task_comm_offset = off;
+            printk(KERN_INFO "wanbai: probed task_struct.comm offset=0x%x\n", off);
+            return;
+        }
+    }
+    printk(KERN_WARNING "wanbai: task_struct.comm offset probe failed\n");
+}
+
+static int32_t find_pid_by_name(const char *target_name)
+{
+    if (!target_name || !target_name[0] || !kp_find_get_pid || !kp_put_pid)
+        return -1;
+
+    int max_pid = 65535;
+    int *p_max = (int *)kallsyms_lookup_name("pid_max");
+    if (p_max && *p_max > 0 && *p_max <= 4194304) {
+        max_pid = *p_max;
+        if (max_pid > 65535) max_pid = 65535;
+    }
+
+    size_t target_len = kpm_strlen(target_name);
+
+    for (int pid = 1; pid <= max_pid; pid++) {
+        struct pid *p = kp_find_get_pid(pid);
+        if (!p) continue;
+
+        int matched = 0;
+
+        if (task_comm_offset > 0 && kp_pid_task) {
+            kpm_rcu_read_lock();
+            struct task_struct *t = kp_pid_task(p, PIDTYPE_PID);
+            if (t) {
+                char comm[17];
+                for (int i = 0; i < 16; i++) {
+                    kp_safe_read(&comm[i], (char *)t + task_comm_offset + i, 1);
+                }
+                comm[16] = '\0';
+
+                if (comm[0] != '\0') {
+                    if (kpm_strcasestr(comm, target_name) || kpm_strcasestr(target_name, comm)) {
+                        matched = 1;
+                    } else if (target_len >= 15) {
+                        /* Match prefix for 15-character truncated comm */
+                        int prefix_match = 1;
+                        for (int i = 0; i < 15 && comm[i]; i++) {
+                            if (kpm_tolower_char(comm[i]) != kpm_tolower_char(target_name[i])) {
+                                prefix_match = 0;
+                                break;
+                            }
+                        }
+                        if (prefix_match) matched = 1;
+                    }
+                }
+            }
+            kpm_rcu_read_unlock();
+        }
+
+        /* Secondary check: check VMAs for package name (e.g. base.apk path) */
+        if (!matched && target_len > 3) {
+            if (module_base_vma(pid, target_name) > 0) {
+                matched = 1;
+            }
+        }
+
+        kp_put_pid(p);
+
+        if (matched) {
+            return pid;
+        }
+    }
+
+    return -1;
+}
+
+/* -----------------------------------------------------------------------
+ * Dynamic touchscreen device discovery and input event injection
+ * --------------------------------------------------------------------- */
+static struct input_dev *find_touchscreen_dev(const char *preferred_name)
+{
+    if (p_touch_dev && (!preferred_name || !preferred_name[0]))
+        return p_touch_dev;
+
+    struct list_head *dev_list = (struct list_head *)kallsyms_lookup_name("input_dev_list");
+    if (!dev_list || !dev_list->next || dev_list->next == dev_list) {
+        printk(KERN_WARNING "wanbai: input_dev_list empty or not found\n");
+        return NULL;
+    }
+
+    struct input_dev *found = NULL;
+    struct input_dev *fallback_touch = NULL;
+
+    /* Scan candidate list_node offsets in struct input_dev (0x20..0x800) */
+    for (int node_off = 0x20; node_off <= 0x800; node_off += 8) {
+        struct list_head *curr = dev_list->next;
+        int valid_list = 0;
+        int count = 0;
+
+        while (curr && curr != dev_list && count < 64) {
+            count++;
+            char *candidate_dev = (char *)curr - node_off;
+            char *name_ptr = NULL;
+            if (kp_safe_read(&name_ptr, candidate_dev, sizeof(name_ptr)) || !name_ptr)
+                break;
+            if ((uint64_t)name_ptr < 0xffff000000000000ULL)
+                break;
+
+            char dev_name[64];
+            for (int i = 0; i < 63; i++) {
+                char c = 0;
+                if (kp_safe_read(&c, name_ptr + i, 1) || c == '\0') {
+                    dev_name[i] = '\0';
+                    break;
+                }
+                dev_name[i] = c;
+            }
+            dev_name[63] = '\0';
+
+            if (dev_name[0] >= 0x20 && dev_name[0] <= 0x7e) {
+                valid_list++;
+                /* Check if this device matches touchscreen heuristics */
+                if (preferred_name && preferred_name[0] && kpm_strcasestr(dev_name, preferred_name)) {
+                    found = (struct input_dev *)candidate_dev;
+                    printk(KERN_INFO "wanbai: found requested input device: '%s' at %px\n", dev_name, found);
+                    break;
+                }
+                if (kpm_strcasestr(dev_name, "touch") || kpm_strcasestr(dev_name, "ts") ||
+                    kpm_strcasestr(dev_name, "synaptics") || kpm_strcasestr(dev_name, "goodix") ||
+                    kpm_strcasestr(dev_name, "fts") || kpm_strcasestr(dev_name, "sec_touch")) {
+                    fallback_touch = (struct input_dev *)candidate_dev;
+                    printk(KERN_INFO "wanbai: detected touchscreen device: '%s' at %px\n", dev_name, fallback_touch);
+                }
+            }
+
+            struct list_head *next_node = NULL;
+            if (kp_safe_read(&next_node, curr, sizeof(next_node)) || !next_node)
+                break;
+            curr = next_node;
+        }
+
+        if (found) break;
+        if (valid_list >= 2 && fallback_touch) break;
+    }
+
+    if (found) {
+        p_touch_dev = found;
+        return found;
+    }
+    if (fallback_touch) {
+        p_touch_dev = fallback_touch;
+        return fallback_touch;
+    }
+
+    return NULL;
+}
+
+static int inject_touch_event(int type, int code, int value)
+{
+    if (!kp_input_event)
+        return -22;
+
+    struct input_dev *dev = p_touch_dev;
+    if (!dev)
+        dev = find_touchscreen_dev(NULL);
+
+    if (!dev) {
+        printk(KERN_ERR "wanbai: inject_touch_event: no touchscreen device found\n");
+        return -19; /* -ENODEV */
+    }
+
+    kp_input_event(dev, (unsigned int)type, (unsigned int)code, value);
+    return 0;
+}
 
 /* -----------------------------------------------------------------------
  * ioctl handler
@@ -721,6 +1000,98 @@ static long wanbai_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         if (ctu_ret) return -14;
         return 0;
     }
+    case OP_GET_PID: {
+        /* Support multiple userspace struct layouts:
+         * 1) struct { char name[256]; int32_t pid; }
+         * 2) struct { int32_t pid; uint32_t _pad; char *name; }
+         * 3) struct { int32_t pid; uint32_t _pad; char name[256]; }
+         * 4) struct { char *name; int32_t pid; } */
+        char raw_buf[288];
+        long cfu = kp_copy_from_user(raw_buf, (void *)arg, sizeof(raw_buf));
+        if (cfu) return -14;
+
+        char target_name[256];
+        target_name[0] = '\0';
+
+        /* Check if raw_buf[0] starts with printable ASCII chars */
+        if (raw_buf[0] >= 0x20 && raw_buf[0] <= 0x7e) {
+            for (int i = 0; i < 255; i++) {
+                char c = raw_buf[i];
+                if (c < 0x20 || c > 0x7e) { target_name[i] = '\0'; break; }
+                target_name[i] = c;
+            }
+            target_name[255] = '\0';
+        }
+
+        /* Check if offset 8 is a userspace pointer */
+        if (target_name[0] == '\0') {
+            uint64_t ptr = *(uint64_t *)(raw_buf + 8);
+            if (ptr > 0x1000 && ptr < 0x800000000000ULL) {
+                if (kp_copy_from_user(target_name, (void *)(uintptr_t)ptr, sizeof(target_name) - 1) == 0) {
+                    target_name[255] = '\0';
+                }
+            }
+        }
+
+        /* Check if offset 0 is a userspace pointer */
+        if (target_name[0] == '\0') {
+            uint64_t ptr = *(uint64_t *)raw_buf;
+            if (ptr > 0x1000 && ptr < 0x800000000000ULL) {
+                if (kp_copy_from_user(target_name, (void *)(uintptr_t)ptr, sizeof(target_name) - 1) == 0) {
+                    target_name[255] = '\0';
+                }
+            }
+        }
+
+        /* Check if offset 8 starts with printable ASCII */
+        if (target_name[0] == '\0' && raw_buf[8] >= 0x20 && raw_buf[8] <= 0x7e) {
+            for (int i = 0; i < 255; i++) {
+                char c = raw_buf[8 + i];
+                if (c < 0x20 || c > 0x7e) { target_name[i] = '\0'; break; }
+                target_name[i] = c;
+            }
+            target_name[255] = '\0';
+        }
+
+        if (target_name[0] == '\0') {
+            return -22;
+        }
+
+        int32_t found_pid = find_pid_by_name(target_name);
+        if (found_pid <= 0) {
+            return -3;
+        }
+
+        /* Write PID back into common response offsets (0, 8, 256) */
+        *(int32_t *)raw_buf = found_pid;
+        *(int32_t *)(raw_buf + 8) = found_pid;
+        *(int32_t *)(raw_buf + 256) = found_pid;
+
+        long ctu = kp_copy_to_user((void *)arg, raw_buf, sizeof(raw_buf));
+        if (ctu) return -14;
+
+        return 0;
+    }
+    case OP_TOUCH_INIT:
+    case OP_CALLFUNC_1: {
+        /* Handshake & auto-locate touchscreen device (supports tscape_input 0x900) */
+        char dev_hint[64];
+        dev_hint[0] = '\0';
+        if (arg) {
+            kp_copy_from_user(dev_hint, (void *)arg, sizeof(dev_hint) - 1);
+            dev_hint[sizeof(dev_hint) - 1] = '\0';
+        }
+        find_touchscreen_dev(dev_hint[0] ? dev_hint : NULL);
+        return 0;
+    }
+    case OP_TOUCH_EVENT: {
+        TOUCH_EVENT te;
+        long cfu = kp_copy_from_user(&te, (void *)arg, sizeof(te));
+        if (cfu) return -14;
+
+        int ret = inject_touch_event(te.type, te.code, te.value);
+        return ret;
+    }
     default:
         return -25;
     }
@@ -750,14 +1121,31 @@ static long wanbai_init(const char *args, const char *event, void *__user rsv)
     if (!var) { printk(KERN_ERR "wanbai: missing: " sym "\n"); missing++; }
 
     RESOLVE(kp_find_get_pid,    "find_get_pid");
+    kp_pid_task = (t_pid_task)kallsyms_lookup_name("pid_task");
+    kp_access_remote_vm = (t_access_remote_vm)kallsyms_lookup_name("access_remote_vm");
+    if (!kp_access_remote_vm)
+        kp_access_remote_vm = (t_access_remote_vm)kallsyms_lookup_name("__access_remote_vm");
+
+    kp_rcu_read_lock_fn = (t_rcu_lock)kallsyms_lookup_name("__rcu_read_lock");
+    if (!kp_rcu_read_lock_fn)
+        kp_rcu_read_lock_fn = (t_rcu_lock)kallsyms_lookup_name("rcu_read_lock");
+
+    kp_rcu_read_unlock_fn = (t_rcu_lock)kallsyms_lookup_name("__rcu_read_unlock");
+    if (!kp_rcu_read_unlock_fn)
+        kp_rcu_read_unlock_fn = (t_rcu_lock)kallsyms_lookup_name("rcu_read_unlock");
+
     RESOLVE(kp_get_pid_task,    "get_pid_task");
     RESOLVE(kp_put_pid,         "put_pid");
-    RESOLVE(kp_put_task_struct, "__put_task_struct");
+    kp_put_task_struct = (t_put_task_struct)kallsyms_lookup_name("__put_task_struct");
     RESOLVE(kp_get_task_mm,     "get_task_mm");
     RESOLVE(kp_mmput,           "mmput");
     RESOLVE(kp_access_process_vm, "access_process_vm");
     RESOLVE(kp_misc_register,   "misc_register");
     RESOLVE(kp_misc_deregister, "misc_deregister");
+
+    kp_input_event = (t_input_event)kallsyms_lookup_name("input_event");
+    if (!kp_input_event)
+        kp_input_event = (t_input_event)kallsyms_lookup_name("input_handle_event");
     /* __kmalloc was renamed to __kmalloc_noprof in kernel 6.10+ (alloc_tag profiling) */
     kp_kmalloc = (t_kmalloc)kallsyms_lookup_name("__kmalloc");
     if (!kp_kmalloc) kp_kmalloc = (t_kmalloc)kallsyms_lookup_name("__kmalloc_noprof");
@@ -817,6 +1205,9 @@ static long wanbai_init(const char *args, const char *event, void *__user rsv)
         printk(KERN_ERR "wanbai: %d symbols missing, aborting\n", missing);
         return -2;
     }
+
+    /* Probe task_struct.comm offset from init_task */
+    probe_task_comm_offset();
 
     printk(KERN_INFO "wanbai: symbols OK\n");
 
