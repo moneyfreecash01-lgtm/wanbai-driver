@@ -19,7 +19,7 @@
 #include <linux/printk.h>
 
 KPM_NAME("universal-ioctl-driver");
-KPM_VERSION("3.0.2");
+KPM_VERSION("3.0.3");
 KPM_LICENSE("ALL RIGHTS RESERVED BY ALEX5402");
 KPM_AUTHOR("@alex5402");
 KPM_DESCRIPTION("Universal ioctl driver supports Gt driver, dit-driver, dit pro driver,  wanbai driver, LDG kpm driver, for 4.4 to all latest kernels (/dev/wanbai) for support visit t.me/alex5402");
@@ -1001,14 +1001,12 @@ static long wanbai_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         return 0;
     }
     case OP_GET_PID: {
-        /* Support multiple userspace struct layouts:
-         * 1) struct { char name[256]; int32_t pid; }
-         * 2) struct { int32_t pid; uint32_t _pad; char *name; }
-         * 3) struct { int32_t pid; uint32_t _pad; char name[256]; }
-         * 4) struct { char *name; int32_t pid; } */
         char raw_buf[288];
         long cfu = kp_copy_from_user(raw_buf, (void *)arg, sizeof(raw_buf));
-        if (cfu) return -14;
+        if (cfu) {
+            printk(KERN_ERR "wanbai: OP_GET_PID copy_from_user failed: %ld\n", cfu);
+            return -14;
+        }
 
         char target_name[256];
         target_name[0] = '\0';
@@ -1054,13 +1052,19 @@ static long wanbai_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         }
 
         if (target_name[0] == '\0') {
+            printk(KERN_ERR "wanbai: OP_GET_PID: unable to parse target process name from userspace buffer\n");
             return -22;
         }
 
+        printk(KERN_INFO "wanbai: OP_GET_PID looking up process: '%s'\n", target_name);
+
         int32_t found_pid = find_pid_by_name(target_name);
         if (found_pid <= 0) {
+            printk(KERN_WARNING "wanbai: OP_GET_PID process '%s' NOT FOUND\n", target_name);
             return -3;
         }
+
+        printk(KERN_INFO "wanbai: OP_GET_PID process '%s' FOUND => pid=%d\n", target_name, found_pid);
 
         /* Write PID back into common response offsets (0, 8, 256) */
         *(int32_t *)raw_buf = found_pid;
@@ -1068,7 +1072,10 @@ static long wanbai_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         *(int32_t *)(raw_buf + 256) = found_pid;
 
         long ctu = kp_copy_to_user((void *)arg, raw_buf, sizeof(raw_buf));
-        if (ctu) return -14;
+        if (ctu) {
+            printk(KERN_ERR "wanbai: OP_GET_PID copy_to_user failed: %ld\n", ctu);
+            return -14;
+        }
 
         return 0;
     }
