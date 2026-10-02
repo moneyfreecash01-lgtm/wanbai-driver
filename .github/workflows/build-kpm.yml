@@ -16,26 +16,31 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y curl xz-utils
 
-      - name: Download Toolchain
+      - name: Download & Extract Toolchain
         run: |
           mkdir -p compiler
           curl -L -o arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf.tar.xz \
             https://armkeil.blob.core.windows.net/developer/Files/downloads/gnu/12.2.rel1/binrel/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf.tar.xz
-          tar -Jxf arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf.tar.xz -C compiler --strip-components=1
+          tar -xJf arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf.tar.xz
+          mv arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf/* compiler/ 2>/dev/null || true
+          rm -rf arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf*
+          echo "=== Checking compiler ==="
+          ls -la compiler/bin/ | head -5
+          file compiler/bin/aarch64-none-elf-gcc
 
       - name: Build KPM
         run: |
           chmod +x build-kpm.sh
-          ./build-kpm.sh wanbai-driver ./compiler/bin/aarch64-none-elf-
+          ./build-kpm.sh wanbai-driver $(pwd)/compiler/bin/aarch64-none-elf-
 
       - name: List built files
         run: |
           find . -name "*.kpm" 2>&1
-          ls -lh kpms/wanbai-driver/ 2>&1
+          ls -lh kpms/wanbai-driver/*.kpm 2>&1
 
       - name: Upload KPM
         uses: actions/upload-artifact@v4
         with:
           name: wanbai-kpm
-          path: kpms/wanbai-driver/*.kpm
+          path: kpms/wanbai-driver/wanbai.kpm
           if-no-files-found: error
