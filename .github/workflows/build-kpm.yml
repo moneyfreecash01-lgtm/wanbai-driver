@@ -26,7 +26,7 @@ jobs:
       - name: Build KPM
         run: |
           chmod +x build-kpm.sh
-          ./build-kpm.sh wanbai-driver ./compiler/bin/aarch64-none-elf-
+          bash -x ./build-kpm.sh wanbai-driver ./compiler/bin/aarch64-none-elf-
 
       - name: Upload KPM
         uses: actions/upload-artifact@v4
