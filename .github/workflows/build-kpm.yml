@@ -24,19 +24,21 @@ jobs:
           tar -xJf arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf.tar.xz
           mv arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf/* compiler/ 2>/dev/null || true
           rm -rf arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf*
-          echo "=== Checking compiler ==="
-          ls -la compiler/bin/ | head -5
-          file compiler/bin/aarch64-none-elf-gcc
+          test -x compiler/bin/aarch64-none-elf-gcc && echo "GCC OK"
 
       - name: Build KPM
         run: |
           chmod +x build-kpm.sh
           ./build-kpm.sh wanbai-driver $(pwd)/compiler/bin/aarch64-none-elf-
 
-      - name: List built files
+      - name: Debug build output
         run: |
-          find . -name "*.kpm" 2>&1
-          ls -lh kpms/wanbai-driver/*.kpm 2>&1
+          echo "---find---"
+          find . -name "*.kpm" -type f 2>&1
+          echo "---kpms dir---"
+          ls -R kpms 2>&1
+          echo "---wanbai-driver dir---"
+          ls -lh kpms/wanbai-driver/ 2>&1
 
       - name: Upload KPM
         uses: actions/upload-artifact@v4
