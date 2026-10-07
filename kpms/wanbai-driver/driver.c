@@ -18,11 +18,11 @@
 #include <ktypes.h>
 #include <linux/printk.h>
 
-KPM_NAME("universal-ioctl-driver");
-KPM_VERSION("3.0.3");
-KPM_LICENSE("ALL RIGHTS RESERVED BY ALEX5402");
-KPM_AUTHOR("@alex5402");
-KPM_DESCRIPTION("Universal ioctl driver supports Gt driver, dit-driver, dit pro driver,  wanbai driver, LDG kpm driver, for 4.4 to all latest kernels (/dev/wanbai) for support visit t.me/alex5402");
+KPM_NAME("Nexora-KPM");
+KPM_VERSION("1");
+KPM_LICENSE("ALL RIGHTS RESERVED BY Nexora");
+KPM_AUTHOR("@nexoraproff");
+KPM_DESCRIPTION("This is a Kpm Module by Nexora Beta");
 
 #define OP_INIT_KEY     0x800
 #define OP_READ_MEM     0x801
